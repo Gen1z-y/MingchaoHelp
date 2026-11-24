@@ -1,0 +1,8 @@
+__pycache__/
+.venv/
+.ocr-models/
+.local/
+.pack/
+/MingchaoHelp*.exe
+/MingchaoHelp.exe~RF*.TMP
+
