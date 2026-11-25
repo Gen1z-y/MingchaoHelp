@@ -68,6 +68,10 @@ class Echo:
             raise ValueError("副词条重复，请核对固定值和百分比")
         stat_vector(self.main + self.sub)
 
+    @property
+    def needs_review(self):
+        return bool(self.warnings) or self.sonata == "未识别" or self.owner == UNKNOWN_OWNER
+
     def stats(self):
         return stat_vector(self.main + self.sub)
 
@@ -95,6 +99,20 @@ class Inventory:
             )
             self.db.execute("DELETE FROM recognition_failures WHERE id = ?", (echo.id,))
             self.db.execute("DELETE FROM deleted_cards WHERE id = ?", (echo.id,))
+
+    def update_echo(self, previous, edited):
+        if previous.id != edited.id:
+            raise ValueError("修正必须保留原声骸记录")
+        edited.validate()
+        self.db.execute("BEGIN IMMEDIATE")
+        with self.db:
+            row = self.db.execute("SELECT data FROM echoes WHERE id = ?", (previous.id,)).fetchone()
+            if not row or self.decode_echo(row[0]) != previous:
+                raise ValueError("这条声骸已变更，请刷新后重新编辑")
+            data = json.loads(row[0])
+            data.update(vars(edited), name=canonical_echo_name(edited.name))
+            self.db.execute("UPDATE echoes SET data = ? WHERE id = ?",
+                            (json.dumps(data, ensure_ascii=False), edited.id))
 
     def equip(self, owner, echoes):
         expected_owners = {echo.id: echo.owner for echo in echoes}
@@ -148,19 +166,21 @@ class Inventory:
                     self.db.execute("DELETE FROM deleted_cards WHERE id = ?", (echo_id,))
         return remaining
 
+    @staticmethod
+    def decode_echo(payload):
+        data = json.loads(payload)
+        data["name"] = canonical_echo_name(data["name"])
+        for key in ("main", "sub"):
+            data[key] = tuple((name, value) for name, value in data[key])
+        data.pop("image", None)
+        if data.get("owner") == "装配中（待确认）":
+            data["owner"] = UNKNOWN_OWNER
+        data["warnings"] = tuple(data.get("warnings", ()))
+        return Echo(**data)
+
     def all(self):
-        echoes = []
-        for (payload,) in self.db.execute("SELECT data FROM echoes ORDER BY rowid"):
-            data = json.loads(payload)
-            data["name"] = canonical_echo_name(data["name"])
-            for key in ("main", "sub"):
-                data[key] = tuple((name, value) for name, value in data[key])
-            data.pop("image", None)
-            if data.get("owner") == "装配中（待确认）":
-                data["owner"] = UNKNOWN_OWNER
-            data["warnings"] = tuple(data.get("warnings", ()))
-            echoes.append(Echo(**data))
-        return echoes
+        return [self.decode_echo(payload) for (payload,) in
+                self.db.execute("SELECT data FROM echoes ORDER BY rowid")]
 
     def record_failure(self, record_id, message):
         with self.db:
@@ -169,6 +189,11 @@ class Inventory:
 
     def failure_count(self):
         return self.db.execute("SELECT count(*) FROM recognition_failures").fetchone()[0]
+
+    def recent_failures(self, limit=100):
+        return self.db.execute(
+            "SELECT id, message FROM recognition_failures ORDER BY rowid DESC LIMIT ?", (limit,)
+        ).fetchall()
 
     def remove_legacy_image_paths(self, captures):
         for echo_id, payload in self.db.execute("SELECT id, data FROM echoes").fetchall():

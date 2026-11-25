@@ -14,9 +14,9 @@ import unicodedata
 import webbrowser
 
 from app_paths import LOCAL_DATA
-from auto_scan import ScanJob, migrate_anchors, worker
+from auto_scan import COLUMNS, ScanJob, migrate_anchors, worker
 from capture import capture_game, collect_with_hotkey
-from echoes import Inventory, PERCENT_STATS
+from echoes import Inventory, PERCENT_STATS, STAT_NAMES, UNKNOWN_OWNER
 from ingest import Reader, ReadResult
 from optimizer import Profile, evaluate, solve
 from profiles import ALL_SONATAS, GUIDES, OFFICIAL_GUIDES, PREVIOUS_GUIDES, ROLE_ORDER, guide_defaults
@@ -56,6 +56,7 @@ def setup_theme(root):
     style.configure(".", font=FONT, background=BG, foreground=TEXT)
     style.configure("TFrame", background=BG)
     style.configure("Card.TFrame", background=PANEL)
+    style.configure("Card.TCheckbutton", background=PANEL)
     style.configure("TLabel", background=BG, foreground=TEXT)
     style.configure("Title.TLabel", font=(FONT[0], 24, "bold"))
     style.configure("Section.TLabel", background=PANEL, font=(FONT[0], 13, "bold"))
@@ -304,19 +305,30 @@ class Window:
             center = key in {"cost", "level"}
             self.tree.column(key, width=width, stretch=not center, anchor="center" if center else "w")
         self.tree.tag_configure("odd", background=ROW)
+        self.tree.tag_configure("review", foreground="#ffc779")
         self.tree.grid(row=1, column=0, sticky="nsew")
         scrollbar = ttk.Scrollbar(listing, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=scrollbar.set)
         scrollbar.grid(row=1, column=1, sticky="ns")
         self.tree.bind("<<TreeviewSelect>>", self.show_echo)
         self.filter_text.trace_add("write", lambda *_: self.render_inventory())
+        review_bar = ttk.Frame(listing, style="Card.TFrame")
+        review_bar.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        self.review_only = tk.BooleanVar()
+        ttk.Checkbutton(review_bar, text="只看待核对", variable=self.review_only,
+                        style="Card.TCheckbutton").pack(side="left")
+        self.review_only.trace_add("write", lambda *_: self.render_inventory())
         self.inventory_note = tk.StringVar()
-        ttk.Label(listing, textvariable=self.inventory_note, style="Hint.TLabel").grid(
-            row=2, column=0, sticky="w", pady=(9, 0))
+        ttk.Label(review_bar, textvariable=self.inventory_note, style="Hint.TLabel").pack(side="left", padx=8)
+        self.failure_button = ttk.Button(review_bar, command=self.show_scan_failures)
 
         side = ttk.Frame(tab, padding=17, width=305, style="Card.TFrame")
         side.grid(row=1, column=1, sticky="nsew")
-        ttk.Label(side, text="声骸详情", style="Section.TLabel").pack(anchor="w")
+        detail_header = ttk.Frame(side, style="Card.TFrame")
+        detail_header.pack(fill="x")
+        ttk.Label(detail_header, text="声骸详情", style="Section.TLabel").pack(side="left")
+        self.edit_echo_button = ttk.Button(detail_header, text="编辑", command=self.edit_selected_echo)
+        self.edit_echo_button.pack(side="right")
         self.echo_name = tk.StringVar(value="请选择声骸")
         ttk.Label(side, textvariable=self.echo_name, style="Name.TLabel", wraplength=265).pack(
             anchor="w", fill="x", pady=(14, 3))
@@ -339,10 +351,14 @@ class Window:
         self.echoes = {echo.id: echo for echo in self.inventory.all()}
         self.update_sonata_choices()
         failures = self.inventory.failure_count()
-        uncertain = sum(bool(echo.warnings) for echo in self.echoes.values())
+        uncertain = sum(echo.needs_review for echo in self.echoes.values())
         self.header_count.set(f"本地库存  {len(self.echoes):,} 件")
-        self.inventory_note.set(f"字段未识别 {uncertain:,} 件  ·  整条未识别 {failures:,} 件"
-                                if failures or uncertain else "识别完成的词条会自动入库")
+        self.inventory_note.set(f"{uncertain:,} 件待核对" if uncertain else "")
+        if failures:
+            self.failure_button.configure(text=f"扫描异常 {failures:,} 条")
+            self.failure_button.pack(side="right")
+        else:
+            self.failure_button.pack_forget()
         self.render_inventory()
 
     def render_inventory(self):
@@ -351,10 +367,16 @@ class Window:
         y = self.tree.yview()
         self.tree.delete(*self.tree.get_children())
         shown = 0
+        review_only = self.review_only.get()
         for echo in self.echoes.values():
+            if review_only and not echo.needs_review:
+                continue
             if query and query not in f"{echo.name} {echo.sonata} {echo.owner}".casefold():
                 continue
-            self.tree.insert("", "end", iid=echo.id, tags=("odd",) if shown % 2 else (),
+            tags = ("odd",) if shown % 2 else ()
+            if echo.needs_review:
+                tags += ("review",)
+            self.tree.insert("", "end", iid=echo.id, tags=tags,
                              values=(echo.name, echo.cost, f"+{echo.level}", echo.sonata, echo.owner or "—"))
             shown += 1
         self.count.set(f"{shown:,} 件")
@@ -369,6 +391,7 @@ class Window:
         selected = self.tree.selection()
         echo = self.echoes.get(selected[0]) if selected else None
         self.echo_name.set(echo.name if echo else "请选择声骸")
+        self.edit_echo_button.state(["!disabled"] if echo else ["disabled"])
         if echo:
             meta = f"COST {echo.cost}  ·  +{echo.level}\n{echo.sonata}"
             if echo.owner:
@@ -379,6 +402,123 @@ class Window:
         for key, panel in self.stat_panels.items():
             panel.set(display_stats(getattr(echo, key)) or "—" if echo else "—")
         self.detail.set(" · ".join(echo.warnings) if echo else "")
+
+    def edit_selected_echo(self):
+        selection = self.tree.selection()
+        if self.busy or not selection:
+            return
+        echo = self.echoes[selection[0]]
+        dialog = tk.Toplevel(self.root)
+        dialog.title("编辑声骸")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        dialog.bind("<Escape>", lambda _: dialog.destroy())
+        form = ttk.Frame(dialog, padding=16)
+        form.pack(fill="both", expand=True)
+        fields = {}
+        sonatas = sorted(set(SONATA_NAMES) | {entry.sonata for entry in self.echoes.values()})
+        roles = tuple(dict.fromkeys(("", UNKNOWN_OWNER, *ROLE_ORDER, *self.role_settings)))
+        metadata = (
+            ("name", "名称", echo.name, ()),
+            ("sonata", "合鸣套装", echo.sonata, sonatas),
+            ("cost", "COST", str(echo.cost), ("1", "3", "4")),
+            ("owner", "穿戴角色", echo.owner, roles),
+        )
+        for row, (key, label, value, choices) in enumerate(metadata):
+            variable = fields[key] = tk.StringVar(value=value)
+            ttk.Label(form, text=label).grid(row=row, column=0, sticky="w", padx=(0, 12), pady=2)
+            if choices:
+                widget = ttk.Combobox(form, textvariable=variable, values=choices,
+                                      state="readonly" if key == "cost" else "normal")
+            else:
+                widget = ttk.Entry(form, textvariable=variable)
+            widget.grid(row=row, column=1, columnspan=2, sticky="ew", pady=2)
+
+        stats = {"main": [], "sub": []}
+        for key, title, start, count in (("main", "主属性", 4, 2), ("sub", "副词条", 7, 5)):
+            ttk.Label(form, text=title).grid(row=start, column=0, sticky="w", pady=(9, 3))
+            entries = getattr(echo, key)
+            for index in range(count):
+                name, value = entries[index] if index < len(entries) else ("", None)
+                stat = tk.StringVar(value=name)
+                number = tk.StringVar(value=f"{value:g}" if value is not None else "")
+                stats[key].append((stat, number))
+                row = start + index + 1
+                ttk.Combobox(form, textvariable=stat, values=("", *STAT_NAMES), state="readonly",
+                             width=22).grid(row=row, column=1, sticky="ew", pady=2)
+                ttk.Entry(form, textvariable=number, width=9).grid(row=row, column=2, padx=(8, 0), pady=2)
+
+        notice = tk.StringVar(value=" · ".join(echo.warnings) or "穿戴角色留空表示未穿戴。")
+        ttk.Label(form, textvariable=notice, wraplength=350).grid(
+            row=13, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
+        def read_stats(entries):
+            values = []
+            for stat, number in entries:
+                name = stat.get()
+                value = number.get().strip()
+                if name or value:
+                    if not name or not value:
+                        raise ValueError("请同时填写词条名称和数值")
+                    try:
+                        values.append((name, float(value.removesuffix("%"))))
+                    except ValueError:
+                        raise ValueError(f"「{name}」的数值无效") from None
+            return tuple(values)
+
+        def save():
+            if self.busy:
+                notice.set("请等当前操作完成再保存")
+                return
+            try:
+                edited = replace(
+                    echo, name=fields["name"].get().strip(), sonata=fields["sonata"].get().strip(),
+                    cost=int(fields["cost"].get()), owner=fields["owner"].get().strip(),
+                    main=read_stats(stats["main"]), sub=read_stats(stats["sub"]), warnings=(),
+                )
+                self.inventory.update_echo(echo, edited)
+            except (ValueError, sqlite3.Error) as error:
+                notice.set(str(error))
+                return
+            dialog.destroy()
+            self.refresh()
+            self.set_output("库存已更新，请重新计算搭配。")
+            self.status.set(f"已保存「{edited.name}」的修正")
+
+        ttk.Button(form, text="保存修正", command=save, style="Primary.TButton").grid(
+            row=14, column=1, columnspan=2, sticky="e", pady=(8, 0))
+        dialog.grab_set()
+
+    def show_scan_failures(self):
+        failures = self.inventory.recent_failures()
+        if not failures:
+            return
+        dialog = tk.Toplevel(self.root)
+        dialog.title("扫描异常")
+        dialog.transient(self.root)
+        dialog.geometry("650x390")
+        dialog.bind("<Escape>", lambda _: dialog.destroy())
+        form = ttk.Frame(dialog, padding=16)
+        form.pack(fill="both", expand=True)
+        description = "可按扫描时的背包排序和筛选定位补扫，也可导入单件详情截图。"
+        if self.inventory.failure_count() > len(failures):
+            description = f"显示最近 {len(failures)} 条。{description}"
+        ttk.Label(form, text=description, wraplength=565).pack(fill="x", pady=(0, 8))
+        entries = tk.Text(form, wrap="word", background=PANEL, foreground=TEXT, padx=9, pady=7,
+                          relief="flat", highlightthickness=0)
+        scrollbar = ttk.Scrollbar(form, command=entries.yview)
+        entries.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        entries.pack(side="left", fill="both", expand=True)
+        for record_id, reason in failures:
+            slot = record_id.rsplit("-", 1)[-1]
+            if record_id.startswith("capture-auto-") and slot.isdecimal():
+                row, col = divmod(int(slot), len(COLUMNS))
+                label = f"自动扫描第 {row + 1} 行、第 {col + 1} 列"
+            else:
+                label = "详情截图"
+            entries.insert("end", f"{label}  ·  {reason}\n\n")
+        entries.configure(state="disabled")
 
     def choose_sonata_to_clear(self):
         if self.busy:
@@ -924,8 +1064,9 @@ class Window:
             f"「{sonata}」有 {count} 种可用声骸，还差 {target - count} 种不同名声骸。"
             for sonata, count, target in result.set_shortages
         ]
-        if result.missing_first:
+        if result.missing_first and not result.diagnostics:
             notices.append("当前条件下缺少推荐首位声骸。")
+        notices.extend(result.diagnostics)
         if not result.builds and not notices:
             notices.append("没有符合套装、首位、COST 和效率要求的搭配。")
         if notices:

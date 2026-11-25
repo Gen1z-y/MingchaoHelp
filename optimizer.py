@@ -1,4 +1,4 @@
-from collections import deque
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from itertools import combinations_with_replacement
 import math
@@ -136,6 +136,7 @@ class SearchResult:
     sonata_types: int = 0
     set_shortages: tuple = ()
     missing_first: bool = False
+    diagnostics: tuple = ()
 
 
 def evaluate(profile, echoes, stats=None, *, first_options=None):
@@ -168,6 +169,34 @@ def maximum_by_stat(vectors):
     return tuple(max(values) for values in zip(*vectors))
 
 
+def explain_inventory_shortages(inventory, scoped, excluded, species, shortages, wanted_firsts):
+    messages = []
+    if wanted_firsts:
+        names = " / ".join(wanted_firsts)
+        matches = [echo for echo in inventory if canonical_echo_name(echo.name) in wanted_firsts]
+        scoped_ids = {echo.id for echo in scoped}
+        blocked = sorted({f"{echo.name}（{echo.owner}）" for echo in matches if echo.id in scoped_ids})
+        if blocked:
+            messages.append("推荐首位因穿戴状态不可用 · " + "、".join(blocked))
+        elif matches:
+            sonatas = "、".join(sorted({echo.sonata for echo in matches}))
+            messages.append(f"推荐首位「{names}」在「{sonatas}」，不符合所选套装。")
+        else:
+            messages.append(f"推荐首位「{names}」未入库。")
+    available_species = set(species.values())
+    for sonata, _, _ in shortages:
+        reserved = defaultdict(set)
+        for echo in excluded:
+            key = (echo.sonata, canonical_echo_name(echo.name))
+            if echo.sonata == sonata and key not in available_species:
+                reserved[echo.owner].add(key[1])
+        if reserved:
+            count = len(set().union(*reserved.values()))
+            owners = "、".join(sorted(reserved))
+            messages.append(f"「{sonata}」另有 {count} 种因穿戴状态不可用（{owners}）。")
+    return tuple(messages)
+
+
 def solve(profile, inventory, *, borrow=False, cost_limit=12, required_set="", set_requirements=(),
           first_echoes=(), limit=5,
           seconds=10, stopped=lambda: False):
@@ -176,20 +205,36 @@ def solve(profile, inventory, *, borrow=False, cost_limit=12, required_set="", s
     set_slots = sum(requirements.values())
     if set_slots > 5 or any(count <= 0 for count in requirements.values()):
         raise ValueError("合鸣套装件数超出五件声骸")
-    echoes = [echo for echo in inventory if (set_slots < 5 or echo.sonata in requirements)
-              and (not echo.owner or echo.owner == profile.name
-                   or (borrow and echo.owner not in {UNKNOWN_OWNER, "装配中（待确认）"}))]
+    inventory = tuple(inventory)
+    scoped = [echo for echo in inventory if set_slots < 5 or echo.sonata in requirements]
+    echoes = [echo for echo in scoped if not echo.owner or echo.owner == profile.name
+              or (borrow and echo.owner not in {UNKNOWN_OWNER, "装配中（待确认）"})]
     species = {echo.id: (echo.sonata, canonical_echo_name(echo.name)) for echo in echoes}
     counts = {name: len({echo_name for sonata, echo_name in species.values() if sonata == name})
               for name in requirements}
     sonata_types = next(iter(counts.values())) if len(counts) == 1 else 0
     shortages = tuple((name, counts[name], target)
                       for name, target in requirements.items() if counts[name] < target)
-    first_names = frozenset(map(canonical_echo_name, first_echoes))
+    first_names = tuple(dict.fromkeys(map(canonical_echo_name, first_echoes)))
     first_ids = {echo.id for echo in echoes if species[echo.id][1] in first_names}
     missing_first = bool(first_names and not first_ids)
     if shortages or missing_first:
-        return SearchResult([], True, 0, len(echoes), sonata_types, shortages, missing_first)
+        excluded = [echo for echo in scoped if echo.id not in species]
+        diagnostics = explain_inventory_shortages(
+            inventory, scoped, excluded, species, shortages, first_names if missing_first else ()
+        )
+        return SearchResult([], True, 0, len(echoes), sonata_types, shortages, missing_first, diagnostics)
+    if len(echoes) < 5:
+        diagnostics = [f"可用声骸还差 {5 - len(echoes)} 件才能凑满五件。"]
+        excluded = [echo for echo in scoped if echo.id not in species]
+        if excluded:
+            owners = "、".join(sorted({echo.owner for echo in excluded}))
+            diagnostics.append(f"另有 {len(excluded)} 件因穿戴状态不可用（{owners}）。")
+        return SearchResult([], True, 0, len(echoes), sonata_types, diagnostics=tuple(diagnostics))
+    minimum_cost = sum(sorted(echo.cost for echo in echoes)[:5])
+    if minimum_cost > cost_limit:
+        diagnostics = (f"最便宜的五件也需要 COST {minimum_cost}，超过上限 {cost_limit}。",)
+        return SearchResult([], True, 0, len(echoes), sonata_types, diagnostics=diagnostics)
     first_costs = {echo.cost for echo in echoes if echo.id in first_ids}
     groups = {1: [], 3: [], 4: []}
     vectors = {}

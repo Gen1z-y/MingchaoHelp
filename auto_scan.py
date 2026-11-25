@@ -431,7 +431,7 @@ def advance_inventory(game, before, pixels_per_drag, take_frame, wait):
     )
 
 
-def scan(game, job, stop, record, pause=sleep):
+def scan(game, job, stop, record, pause=sleep, *, record_failure=None):
     def check():
         if stop():
             raise ScanStopped("已停止自动扫描")
@@ -502,7 +502,10 @@ def scan(game, job, stop, record, pause=sleep):
                 boundary = level_boundary(frame, x, y, label)
                 if boundary:
                     return count, f"遇到首张{boundary}，已结束扫描"
+                record_id = f"capture-auto-{job.id}-{slot:06d}"
                 if label != "+25":
+                    if record_failure:
+                        record_failure(record_id, "等级未读清，已跳过这张卡片")
                     unreadable += 1
                     next_slot = slot + 1
                     checkpoint(slot)
@@ -527,7 +530,7 @@ def scan(game, job, stop, record, pause=sleep):
                     wait(.09)
                 else:
                     raise ScanStopped("点选后无法确认卡片高亮或详情稳定，已停止")
-                result = record(frame.crop(DETAIL), f"capture-auto-{job.id}-{slot:06d}",
+                result = record(frame.crop(DETAIL), record_id,
                                 equipped_hint=equipped_hint, sonata_hint=sonata)
                 if result is ReadResult.FAILED:
                     failed += 1
@@ -588,7 +591,7 @@ def worker(job_id, parent_pid):
             sleep(.10)
         job.write("running", "正在识别声骸背包")
         with Reader(job.root) as reader:
-            count, reason = scan(game, job, stop, reader.record)
+            count, reason = scan(game, job, stop, reader.record, record_failure=reader.db.record_failure)
         job.write("complete", f"{reason} · 共处理 +25 声骸 {count} 件")
     except (ScanStopped, SonataMismatch, OSError, ValueError) as error:
         job.write("stopped", str(error))
