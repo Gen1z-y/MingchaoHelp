@@ -1,11 +1,9 @@
 from collections import Counter
 from dataclasses import replace
-from itertools import groupby
 import json
 import os
 from pathlib import Path
 from queue import Empty, Queue
-import re
 import sqlite3
 from threading import Event, Thread
 from time import sleep
@@ -22,7 +20,7 @@ from echoes import Inventory, PERCENT_STATS
 from ingest import Reader, ReadResult
 from optimizer import Profile, evaluate, solve
 from profiles import ALL_SONATAS, GUIDES, OFFICIAL_GUIDES, PREVIOUS_GUIDES, ROLE_ORDER, guide_defaults
-from rules import ELEMENTS, SETS
+from rules import SETS
 from scanner import SONATA_NAMES
 
 
@@ -35,7 +33,10 @@ TEXT = "#eff5fc"
 MUTED = "#a8b9ce"
 ACCENT = "#76e1c6"
 ACCENT_TEXT = "#102e2b"
+BUILD_BORDER = "#eb6670"
 FONT = ("Microsoft YaHei UI", 10)
+TARGETS = (("target_crit_rate", "暴击目标 %"), ("target_crit_damage", "暴伤目标 %"),
+           ("target_energy", "共鸣效率目标 %"))
 
 
 def display_stats(stats):
@@ -63,6 +64,10 @@ def setup_theme(root):
     style.configure("Hint.TLabel", background=PANEL, foreground=MUTED)
     style.configure("Status.TLabel", foreground=MUTED)
     style.configure("Card.TLabel", background=PANEL, foreground=TEXT)
+    style.configure("Echo.TFrame", background=ROW)
+    style.configure("Echo.TLabel", background=ROW, foreground=TEXT)
+    style.configure("EchoName.TLabel", background=ROW, foreground=TEXT, font=(FONT[0], 10, "bold"))
+    style.configure("EchoMeta.TLabel", background=ROW, foreground=MUTED)
     style.configure("TButton", background=ROW, bordercolor=EDGE, lightcolor=ROW,
                     darkcolor=ROW, padding=(14, 8), foreground=TEXT, focusthickness=1)
     style.map("TButton", background=[("active", "#304660"), ("pressed", "#263850")])
@@ -329,17 +334,6 @@ class Window:
         ttk.Label(side, textvariable=self.detail, style="Hint.TLabel", wraplength=265).pack(
             anchor="w", fill="x", pady=(10, 0))
         return tab
-
-    def field(self, parent, row, key, label, initial="", choices=()):
-        var = tk.StringVar(value=initial)
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=(0, 10), pady=3)
-        if choices:
-            widget = SearchCombobox(parent, var, choices, label=label, on_error=self.status.set, width=25)
-            self.profile_choices[key] = widget
-        else:
-            widget = ttk.Entry(parent, textvariable=var, width=27)
-        widget.grid(row=row, column=1, sticky="ew", pady=3)
-        return var
 
     def refresh(self):
         self.echoes = {echo.id: echo for echo in self.inventory.all()}
@@ -642,25 +636,24 @@ class Window:
         self.run(execute, finished, reset)
         self.root.after(250, poll)
 
+    optimizer_prompt = "选择角色和合鸣套装，按需填写目标，再点击「开始计算」。"
+
     def build_optimizer_tab(self):
         tab = ttk.Frame(self.content)
-        tab.columnconfigure(1, weight=1)
+        tab.columnconfigure(0, weight=1)
         tab.rowconfigure(1, weight=1)
 
         overview = ttk.Frame(tab, style="Card.TFrame", padding=(16, 12))
-        overview.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 12))
+        overview.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 12))
         overview.columnconfigure(8, weight=1)
         self.profile = {}
-        self.profile_choices = {}
         ttk.Label(overview, text="角色", style="Card.TLabel").grid(row=0, column=0, padx=(0, 6))
         self.profile["name"] = tk.StringVar(value="心")
         self.role_choice = SearchCombobox(
             overview, self.profile["name"], ROLE_ORDER, label="角色", allow_custom=True,
             on_select=self.load_role, on_error=self.status.set, width=10)
         self.role_choice.grid(row=0, column=1, padx=(0, 14))
-        for column, key, title in ((2, "target_crit_rate", "暴击目标 %"),
-                                   (4, "target_crit_damage", "暴伤目标 %"),
-                                   (6, "target_energy", "共鸣效率目标 %")):
+        for column, (key, title) in zip((2, 4, 6), TARGETS):
             value = tk.StringVar()
             self.profile[key] = value
             ttk.Label(overview, text=title, style="Card.TLabel").grid(row=0, column=column, padx=(0, 6))
@@ -676,69 +669,27 @@ class Window:
         self.sonata_choice = SearchCombobox(
             overview, set_var, label="合鸣套装", on_error=self.status.set,
             on_select=self.update_first_echo, width=25)
-        self.profile_choices["required_set"] = self.sonata_choice
         self.sonata_choice.grid(row=1, column=1, columnspan=3, sticky="w", pady=(8, 0))
         self.first_echo_text = tk.StringVar()
         ttk.Label(overview, textvariable=self.first_echo_text, style="Card.TLabel",
                   wraplength=395).grid(row=1, column=4, columnspan=6, sticky="w", padx=(10, 0), pady=(8, 0))
         self.guide_description = tk.StringVar()
         ttk.Label(overview, textvariable=self.guide_description, style="Hint.TLabel",
-                  wraplength=800).grid(row=2, column=0, columnspan=10, sticky="w", pady=(7, 0))
+                  wraplength=625).grid(row=2, column=0, columnspan=8, sticky="w", pady=(7, 0))
+        self.reset_button = ttk.Button(overview, text="恢复攻略推荐", command=self.reset_role_guide)
+        self.reset_button.grid(row=2, column=8, columnspan=2, sticky="e", pady=(7, 0))
 
-        controls_area = ttk.Frame(tab, style="Card.TFrame", padding=(10, 8))
-        controls_area.grid(row=1, column=0, sticky="ns", padx=(0, 14))
-        controls_area.rowconfigure(1, weight=1)
-        ttk.Label(controls_area, text="配装设置", style="Section.TLabel").grid(row=0, sticky="w", pady=(0, 8))
-        canvas = tk.Canvas(controls_area, width=345, background=BG, highlightthickness=0)
-        canvas.grid(row=1, column=0, sticky="ns")
-        controls = ttk.Frame(canvas, padding=9)
-        inner = canvas.create_window((0, 0), window=controls, anchor="nw")
-        controls.bind("<Configure>", lambda _: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.bind("<Configure>", lambda event: canvas.itemconfigure(inner, width=event.width))
-        form_scroll = ttk.Scrollbar(controls_area, command=canvas.yview)
-        form_scroll.grid(row=1, column=1, sticky="ns")
-        canvas.configure(yscrollcommand=form_scroll.set)
-        controls.columnconfigure(1, weight=1)
-
-        config = (
-            ("ranking", "达标后排序", "推荐词条", ("推荐词条", "循环伤害")),
-            ("priorities", "词条优先级", "", ()),
-            ("main4", "4 COST 主属性偏好", "", ()),
-            ("main3", "3 COST 主属性偏好", "", ()),
-            ("main1", "1 COST 主属性偏好", "", ()),
-            ("element", "伤害属性", "导电", ELEMENTS),
-            ("scaling", "主要倍率", "攻击", ("攻击", "生命", "防御")),
-            ("base", "基础值（含武器基础值）", "1000", ()),
-            ("extra_flat", "装备前固定加成", "0", ()),
-            ("extra_percent", "装备前百分比加成", "0", ()),
-            ("crit_rate", "装备前暴击率 %", "5", ()),
-            ("crit_damage", "装备前暴伤 %", "150", ()),
-            ("elemental_bonus", "装备前属性伤害 %", "0", ()),
-            ("energy", "装备前共鸣效率 %", "100", ()),
-            ("minimum_energy", "最低共鸣效率 %", "100", ()),
-            ("weights", "普攻 / 重击 / 技能 / 解放 / 其他", "0, 0, 45, 40, 15", ()),
-            ("coverage", "各类型触发覆盖率 %", "100, 100, 100, 100, 100", ()),
-            ("cost_limit", "COST 上限", "12", ()),
-        )
-        self.profile.update({key: self.field(controls, row, key, label, initial, choices)
-                             for row, (key, label, initial, choices) in enumerate(config)})
-        self.borrow = tk.BooleanVar()
-        self.triggered_targets = tk.BooleanVar()
-        ttk.Checkbutton(controls, text="用触发后的暴击和暴伤判断目标", variable=self.triggered_targets).grid(
-            row=len(config), column=0, columnspan=2, sticky="w", pady=5)
-        ttk.Checkbutton(controls, text="允许借用其他角色的声骸", variable=self.borrow).grid(
-            row=len(config) + 1, column=0, columnspan=2, sticky="w", pady=5)
-        for child in (canvas, controls, *controls.winfo_children()):
-            child.bind("<MouseWheel>", lambda event: canvas.yview_scroll(-int(event.delta / 120), "units"),
-                       add=True)
-        self.output = tk.Text(tab, width=50, wrap="word", font=FONT, background=PANEL,
-                              foreground=TEXT, selectbackground="#244c53", relief="flat",
-                              borderwidth=0, highlightthickness=0, padx=18, pady=15,
-                              spacing1=3, spacing3=3)
-        self.output.grid(row=1, column=1, sticky="nsew")
+        self.output = tk.Canvas(tab, background=PANEL, highlightthickness=0,
+                                borderwidth=0, width=0, yscrollincrement=24)
+        self.output.grid(row=1, column=0, sticky="nsew")
+        self.output_body = ttk.Frame(self.output, style="Card.TFrame", padding=(14, 12))
+        output_window = self.output.create_window((0, 0), window=self.output_body, anchor="nw")
+        self.output.bind("<Configure>", lambda event: self.output.itemconfigure(output_window, width=event.width))
+        self.output_body.bind("<Configure>", lambda _: self.output.configure(scrollregion=self.output.bbox("all")))
         scroll = ttk.Scrollbar(tab, command=self.output.yview)
         self.output.configure(yscrollcommand=scroll.set)
-        scroll.grid(row=1, column=2, sticky="ns")
+        scroll.grid(row=1, column=1, sticky="ns")
+        self.root.bind("<MouseWheel>", self.scroll_results, add=True)
         self.profile_path = LOCAL / "character-settings.json"
         try:
             self.role_settings = json.loads(self.profile_path.read_text(encoding="utf-8"))
@@ -746,10 +697,7 @@ class Window:
             self.role_settings = {}
         self.role_choice.set_choices((*ROLE_ORDER, *self.role_settings))
         self.load_role()
-        self.set_output(
-            "选择角色并填写目标面板。目标留空时按所选方式排序。\n"
-            "前往配装设置填写当前武器下、装备声骸前的面板。"
-        )
+        self.set_output(self.optimizer_prompt)
         return tab
 
     def load_role(self):
@@ -758,40 +706,63 @@ class Window:
         self.loaded_role = name
         guide = GUIDES.get(name)
         source = "库洛攻略站" if name in OFFICIAL_GUIDES else "查看攻略"
-        self.source_button.configure(text=source, state="normal" if guide else "disabled")
-        saved = self.role_settings.get(name, {})
-        previous = PREVIOUS_GUIDES.get(name)
-        if guide != previous and saved and not saved.get("uses_guide_defaults"):
-            previous_defaults = guide_defaults(previous)
-            previous_defaults.pop("required_set")
-            saved = {key: value for key, value in saved.items() if value != previous_defaults.get(key)}
-        defaults = {
-            **guide_defaults(guide),
-            "base": "1000", "extra_flat": "0", "extra_percent": "0", "crit_rate": "5",
-            "crit_damage": "150", "elemental_bonus": "0", "energy": "100", "minimum_energy": "100",
-            "weights": "0, 0, 45, 40, 15", "coverage": "100, 100, 100, 100, 100", "cost_limit": "12",
-        }
+        state = "normal" if guide else "disabled"
+        self.source_button.configure(text=source, state=state)
+        reset = "恢复官方推荐" if name in OFFICIAL_GUIDES else "恢复攻略推荐"
+        self.reset_button.configure(text=reset, state=state)
         if guide:
             main = "  ·  ".join(f"{cost} COST {' / '.join(stats)}" for cost, stats in guide.mains)
             self.guide_description.set(main)
-            if guide.scaling == "生命":
-                defaults["base"] = "10000"
         else:
-            self.guide_description.set("自定义角色 · 可设置主词条偏好、副词条顺序和面板目标")
-        for key, default in defaults.items():
-            value = saved.get(key, default)
-            if key == "required_set" and not value:
-                value = default
-            variable = self.profile[key]
-            choice = self.profile_choices.get(key)
-            if choice:
-                choice.commit(value)
-            else:
-                variable.set(value)
+            self.guide_description.set("自定义角色 · 可设置暴击、暴伤和共鸣效率目标")
+        self.apply_role_fields(guide_defaults(guide), self.saved_role_settings(name))
+
+    def saved_role_settings(self, name):
+        saved = self.role_settings.get(name, {})
+        previous = PREVIOUS_GUIDES.get(name)
+        if GUIDES.get(name) != previous and saved and not saved.get("uses_guide_defaults"):
+            previous_defaults = guide_defaults(previous)
+            previous_defaults.pop("required_set")
+            saved = {key: value for key, value in saved.items() if value != previous_defaults.get(key)}
+        return saved
+
+    def apply_role_fields(self, defaults, overrides=None):
+        overrides = overrides or {}
+        for key, _ in TARGETS:
+            self.profile[key].set(overrides.get(key, defaults[key]))
+        self.sonata_choice.commit(overrides.get("required_set") or defaults["required_set"])
         self.update_sonata_choices()
         self.update_first_echo()
-        self.triggered_targets.set(saved.get("targets_triggered", False))
-        self.borrow.set(saved.get("borrow", False))
+
+    def reset_role_guide(self):
+        if self.busy:
+            return
+        try:
+            name = self.role_choice.resolve()
+        except ValueError as error:
+            self.status.set(str(error))
+            return
+        guide = GUIDES.get(name)
+        if not guide:
+            self.status.set("该角色暂无攻略推荐")
+            return
+        self.role_choice.commit(name)
+        if name != self.loaded_role:
+            self.load_role()
+        self.apply_role_fields(guide_defaults(guide))
+        self.role_settings[name] = {"uses_guide_defaults": True}
+        self.set_output(self.optimizer_prompt)
+        try:
+            self.save_role_settings()
+        except OSError:
+            self.status.set("已恢复推荐值，但无法写入角色设置")
+        else:
+            self.status.set("已恢复推荐值，可以重新计算搭配")
+
+    def save_role_settings(self):
+        temporary = self.profile_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(self.role_settings, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary.replace(self.profile_path)
 
     def update_sonata_choices(self):
         guide = GUIDES.get(self.loaded_role)
@@ -820,133 +791,198 @@ class Window:
             self.role_choice.commit(name)
             if name != self.loaded_role:
                 self.load_role()
-            choices = [(choice, choice.resolve()) for choice in self.profile_choices.values()]
-            for choice, value in choices:
-                choice.commit(value)
-            settings = {key: var.get().strip() for key, var in self.profile.items()}
-            fields = settings.copy()
-            selected = fields.pop("required_set")
+            selected = self.sonata_choice.resolve()
+            self.sonata_choice.commit(selected)
             required_set = "" if selected == ALL_SONATAS else selected
-            cost_limit = int(fields.pop("cost_limit"))
-            if not 5 <= cost_limit <= 12:
-                raise ValueError("COST 上限应介于 5 与 12")
-            for key in ("weights", "coverage"):
-                values = (float(value) for value in fields[key].replace("，", ",").split(","))
-                fields[key] = tuple(value / (100 if key == "coverage" else 1) for value in values)
-            for key in ("target_crit_rate", "target_crit_damage", "target_energy"):
-                fields[key] = float(fields[key] or 0)
-            fields["targets_triggered"] = self.triggered_targets.get()
+            settings = {key: self.profile[key].get().strip() for key, _ in TARGETS}
+            targets = {key: float(value or 0) for key, value in settings.items()}
+            settings["required_set"] = selected
 
-            def names(text, separators=r"[,，/>、＞]"):
-                return tuple(item.strip() for item in re.split(separators, text) if item.strip())
-
-            groups = tuple(names(group, r"[=＝]") for group in names(fields["priorities"]))
-            fields["priorities"] = tuple(stat for group in groups for stat in group)
-            fields["priority_ranks"] = tuple(rank for rank, group in enumerate(groups) for _ in group)
-            fields["main_choices"] = tuple((cost, names(fields.pop(f"main{cost}"))) for cost in (1, 3, 4))
-            guide = GUIDES.get(fields["name"])
-            fields["recommended_sets"] = guide.sonatas if guide else ()
+            guide = GUIDES.get(name)
+            recommendations = guide_defaults(guide)
+            groups = tuple(tuple(stat.strip() for stat in group.replace("＝", "=").split("="))
+                           for group in guide.priorities) if guide else ()
+            profile = Profile(
+                name=name,
+                **targets,
+                element=recommendations["element"],
+                scaling=recommendations["scaling"],
+                base=10000 if recommendations["scaling"] == "生命" else 1000,
+                ranking=recommendations["ranking"],
+                priorities=tuple(stat for group in groups for stat in group),
+                priority_ranks=tuple(rank for rank, group in enumerate(groups) for _ in group),
+                main_choices=guide.mains if guide else (),
+                recommended_sets=guide.sonatas if guide else (),
+            )
             requirements, firsts = guide.echo_setup(selected) if guide else (
                 ((required_set, 5),) if required_set else (), ())
-            for key in ("base", "extra_flat", "extra_percent", "crit_rate", "crit_damage",
-                        "elemental_bonus", "energy", "minimum_energy"):
-                fields[key] = float(fields[key])
-            profile = Profile(**fields)
             profile.validate()
         except ValueError as error:
             self.status.set(str(error))
             return
         echoes = list(self.echoes.values())
-        borrow = self.borrow.get()
-        recommendations = guide_defaults(guide)
-        overrides = {key: value for key, value in settings.items() if value != recommendations.get(key)}
-        self.role_settings[profile.name] = {**overrides, "targets_triggered": profile.targets_triggered,
-                                            "borrow": borrow, "uses_guide_defaults": True}
+        overrides = {key: value for key, value in settings.items() if value != recommendations[key]}
+        self.role_settings[profile.name] = {**overrides, "uses_guide_defaults": True}
         self.role_choice.set_choices((*ROLE_ORDER, *self.role_settings))
         self.update_first_echo()
+        status = (f"正在搜索「{required_set}」" if required_set else
+                  f"正在从 {len(echoes)} 件库存中搜索")
         try:
-            temporary = self.profile_path.with_suffix(".tmp")
-            temporary.write_text(json.dumps(self.role_settings, ensure_ascii=False, indent=2), encoding="utf-8")
-            temporary.replace(self.profile_path)
+            self.save_role_settings()
         except OSError:
-            self.status.set("无法写入角色设置，本次仍可计算")
-        self.status.set(f"正在搜索「{required_set}」" if required_set else
-                        f"正在从 {len(echoes)} 件库存中搜索")
-        self.run(lambda: solve(profile, echoes, borrow=borrow, set_requirements=requirements,
-                                first_echoes=firsts, cost_limit=cost_limit),
-                 lambda result: self.show_results(profile, result, echoes, required_set, firsts))
+            status += " · 无法写入角色设置"
+        self.status.set(status)
+        self.run(lambda: solve(profile, echoes, set_requirements=requirements, first_echoes=firsts),
+                 lambda result: self.show_results(profile, result, echoes))
+
+    def scroll_results(self, event):
+        if event.widget == self.output or str(event.widget).startswith(f"{self.output}."):
+            self.output.yview_scroll(-int(event.delta / 120), "units")
+            return "break"
+
+    def clear_output(self):
+        for child in self.output_body.winfo_children():
+            child.destroy()
+        self.output.yview_moveto(0)
+
+    def result_label(self, parent, text, style="Card.TLabel", **options):
+        label = ttk.Label(parent, text=text, style=style, justify="left", **options)
+        label.bind("<Configure>", lambda event: label.configure(wraplength=event.width))
+        return label
 
     def set_output(self, text):
-        self.output.configure(state="normal")
-        self.output.delete("1.0", "end")
-        self.output.insert("1.0", text)
-        self.output.configure(state="disabled")
+        self.clear_output()
+        self.result_label(self.output_body, text).pack(fill="x")
 
-    def show_results(self, profile, result, inventory, required_set="", firsts=()):
+    def show_build_echoes(self, parent, echoes, first_id, owner, show_sonata):
+        grid = ttk.Frame(parent, style="Card.TFrame")
+        grid.pack(fill="x", pady=(10, 0))
+        cards = []
+        ordered = sorted(echoes, key=lambda echo: (echo.id != first_id, -echo.cost))
+        for echo in ordered:
+            detail = ttk.Frame(grid, style="Echo.TFrame", padding=(9, 7))
+            cards.append(detail)
+            title = f"首位 · {echo.name}" if echo.id == first_id else echo.name
+            self.result_label(detail, title, "EchoName.TLabel").pack(fill="x", pady=(0, 2))
+            meta = [f"COST {echo.cost}  ·  +{echo.level}"]
+            if show_sonata:
+                meta.append(echo.sonata)
+            if echo.owner and echo.owner != owner:
+                meta.append(f"借自{echo.owner}")
+            self.result_label(detail, "\n".join(meta), "EchoMeta.TLabel").pack(fill="x")
+            for title, stats in (("主属性", echo.main), ("副词条", echo.sub)):
+                if stats:
+                    self.result_label(detail, title, "EchoName.TLabel").pack(fill="x", pady=(6, 0))
+                    self.result_label(detail, display_stats(stats), "Echo.TLabel").pack(fill="x")
+
+        min_width = round(grid.winfo_fpixels("1.6i"))
+        columns = 0
+
+        def arrange(event):
+            nonlocal columns
+            count = max(1, min(len(cards), event.width // min_width))
+            if count == columns:
+                return
+            for column in range(max(columns, count)):
+                grid.columnconfigure(column, weight=int(column < count), uniform="echo" if column < count else "")
+            for index, detail in enumerate(cards):
+                row, column = divmod(index, count)
+                gap = (0, 6) if column + 1 < count else 0
+                detail.grid(row=row, column=column, sticky="nsew", padx=gap, pady=(0, 6))
+            columns = count
+
+        grid.bind("<Configure>", arrange)
+
+    def show_results(self, profile, result, inventory, *, scroll_position=0):
+        self.clear_output()
+        available = {echo.id: echo for echo in inventory}
         score_label = "推荐词条分" if profile.ranking == "推荐词条" else "伤害指数"
-        lines = [
-            f"{profile.name} · {result.candidates} 件可用 · "
-            + ("搜索完成" if result.complete else "达到搜索时限 · 当前找到的最佳组合"),
-            "按暴击、暴伤和共鸣效率目标的缺口排序，随后比较" + score_label + "。",
+        heading = f"{profile.name} · {result.candidates} 件可用"
+        if result.builds:
+            heading += f" · {len(result.builds)} 套搭配"
+        if not result.complete:
+            heading += " · 搜索超时"
+        self.result_label(self.output_body, heading, "Count.TLabel").pack(fill="x", pady=(0, 8))
+
+        def mark_worn(echoes, number):
+            if self.busy:
+                return
+            try:
+                self.inventory.equip(profile.name, echoes)
+            except (ValueError, sqlite3.Error) as error:
+                self.status.set(f"穿戴同步失败 · {error}")
+                return
+            position = self.output.yview()[0]
+            self.refresh()
+            self.show_results(profile, result, self.echoes.values(), scroll_position=position)
+            self.status.set(f"{profile.name} 已穿戴搭配 {number} · 已同步到声骸库存")
+
+        current = [echo for echo in available.values() if echo.owner == profile.name]
+        worn_ids = {echo.id for echo in current}
+        baseline = evaluate(replace(profile, minimum_energy=0), current) if len(current) == 5 else None
+        notices = [
+            f"「{sonata}」有 {count} 种可用声骸，还差 {target - count} 种不同名声骸。"
+            for sonata, count, target in result.set_shortages
         ]
-        if required_set:
-            lines.insert(1, f"合鸣套装  {required_set}")
-        if firsts:
-            lines.append("首位声骸  " + " / ".join(firsts))
-        if profile.priorities:
-            ranks = profile.priority_ranks or range(len(profile.priorities))
-            groups = groupby(zip(ranks, profile.priorities), key=lambda entry: entry[0])
-            lines.append("词条优先级  " + " › ".join(" = ".join(stat for _, stat in group)
-                                                   for _, group in groups))
-        if profile.target_crit_rate or profile.target_crit_damage or profile.target_energy:
-            lines.append("目标使用" + ("合鸣触发后的面板" if profile.targets_triggered else "常驻面板"))
-        current = [echo for echo in inventory if echo.owner == profile.name]
-        baseline = None
-        if len(current) == 5:
-            baseline = evaluate(replace(profile, minimum_energy=0), current)
-            if baseline:
-                lines.append(f"当前装配  {score_label} {baseline.score:,.1f}")
-        for sonata, available, target in result.set_shortages:
-            lines.append(f"「{sonata}」目前有 {available} 种可用声骸，"
-                         f"还差 {target - available} 种不同名声骸。")
         if result.missing_first:
-            lines.append("当前条件下缺少可用的推荐首位声骸。")
-        if not result.builds and not (result.set_shortages or result.missing_first):
-            lines.append("尚无满足套装、首位、COST 和最低共鸣效率的搭配。")
+            notices.append("当前条件下缺少推荐首位声骸。")
+        if not result.builds and not notices:
+            notices.append("没有符合套装、首位、COST 和效率要求的搭配。")
+        if notices:
+            self.result_label(self.output_body, "\n".join(notices)).pack(fill="x", pady=(0, 10))
+
         for number, build in enumerate(result.builds, 1):
+            echoes = tuple(available.get(echo.id, echo) for echo in build.echoes)
+            echo_ids = {echo.id for echo in echoes}
+            is_worn = echo_ids == worn_ids
+            border = tk.Frame(self.output_body, background=PANEL, borderwidth=0, highlightthickness=2,
+                              highlightbackground=BUILD_BORDER, highlightcolor=BUILD_BORDER)
+            border.pack(fill="x", pady=(0, 12))
+            card = ttk.Frame(border, style="Card.TFrame", padding=(12, 10))
+            card.pack(fill="x")
+            header = ttk.Frame(card, style="Card.TFrame")
+            header.pack(fill="x", pady=(0, 6))
+            button = ttk.Button(header, text="当前穿戴" if is_worn else "已穿戴",
+                                command=lambda pieces=echoes, index=number: mark_worn(pieces, index))
+            if is_worn or echo_ids - available.keys():
+                button.state(["disabled"])
+            button.pack(side="right", padx=(8, 0))
+            total = sum(echo.cost for echo in echoes)
+            title = f"搭配 {number}  ·  {score_label} {build.score:,.1f}  ·  COST {total}"
+            if not is_worn and baseline and baseline.score > 0:
+                difference = 100 * (build.score / baseline.score - 1)
+                if abs(difference) >= 0.05:
+                    title += f"  ·  较当前 {difference:+.1f}%"
+            self.result_label(header, title, "Count.TLabel").pack(side="left", fill="x", expand=True)
+
+            sonatas = Counter(echo.sonata for echo in echoes)
+            sets = "、".join(f"{name} ×{count}" + ("（仅计词条）" if name not in SETS else "")
+                            for name, count in sonatas.items() if name != "未识别")
+            lines = [f"合鸣  {sets}"] if sets else []
             scale, crit, crit_damage, energy, element = profile.panel(build.normal)
             _, on_crit, _, _, on_element = profile.panel(build.triggered)
-            total = sum(echo.cost for echo in build.echoes)
-            lines += ["", f"{number}. {score_label} {build.score:,.1f}  ·  COST {total}"]
-            if baseline and baseline.score > 0:
-                lines.append(f"相对当前 {100 * (build.score / baseline.score - 1):+.1f}%")
-            lines += [
-                "合鸣 " + ("、".join(build.effects) or "无已建模效果"),
-                f"{profile.scaling} {scale:,.1f} · 暴击 {crit:.1f}% · 暴伤 {crit_damage:.1f}%"
-                f" · 共鸣效率 {energy:.1f}% · {profile.element}加成 {element:.1f}%",
-            ]
-            if on_crit != crit or on_element != element:
-                lines.append(f"触发时暴击 {on_crit:.1f}% · {profile.element}加成 {on_element:.1f}%")
+            panel = (f"面板估算  {profile.scaling} {scale:,.1f} · 暴击 {crit:.1f}% · 暴伤 {crit_damage:.1f}%"
+                     f" · 共鸣效率 {energy:.1f}%")
+            if element:
+                panel += f" · {profile.element}加成 {element:.1f}%"
+            lines.append(panel)
+            triggered = []
+            if on_crit != crit:
+                triggered.append(f"暴击 {on_crit:.1f}%")
+            if on_element != element:
+                triggered.append(f"{profile.element}加成 {on_element:.1f}%")
+            if triggered:
+                lines.append("触发时  " + " · ".join(triggered))
             goals = profile.goals(build.normal, build.triggered)
             if goals:
                 shortfalls = [f"{name}差 {target - value:.1f} 个百分点"
                               for name, value, target in goals if value < target - 1e-8]
                 lines.append("目标  " + ("、".join(shortfalls) if shortfalls else "全部达标"))
-            if profile.main_choices and any(preference for _, preference in profile.main_choices):
-                lines.append(f"主属性偏好  {build.main_matches} / 5 件")
-            for echo in (build.first, *(e for e in build.echoes if e.id != build.first.id)):
-                first = "首位 · " if echo.id == build.first.id else ""
-                borrowed = f" · 借自{echo.owner}" if echo.owner and echo.owner != profile.name else ""
-                lines.append(f"  {first}{echo.name} +{echo.level} · COST {echo.cost} · "
-                             f"{echo.sonata}{borrowed}")
-                lines.append("     主  " + display_stats(echo.main).replace("\n", " / "))
-                if echo.sub:
-                    lines.append("     副  " + display_stats(echo.sub).replace("\n", " / "))
-        unknown = sorted({echo.sonata for build in result.builds for echo in build.echoes
-                          if echo.sonata not in SETS})
-        if unknown:
-            lines += ["", "以下套装目前只计算词条：" + "、".join(unknown)]
-        self.set_output("\n".join(lines))
+            self.result_label(card, "\n".join(lines)).pack(fill="x")
+            self.show_build_echoes(card, echoes, build.first.id, profile.name, len(sonatas) > 1)
+        if scroll_position:
+            self.output.update_idletasks()
+            self.output.yview_moveto(scroll_position)
         self.status.set("已更新搭配结果")
 
     def close(self):

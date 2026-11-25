@@ -96,6 +96,32 @@ class Inventory:
             self.db.execute("DELETE FROM recognition_failures WHERE id = ?", (echo.id,))
             self.db.execute("DELETE FROM deleted_cards WHERE id = ?", (echo.id,))
 
+    def equip(self, owner, echoes):
+        expected_owners = {echo.id: echo.owner for echo in echoes}
+        if not owner.strip() or owner in {UNKNOWN_OWNER, "装配中（待确认）"} or len(expected_owners) != 5:
+            raise ValueError("请选择有效角色和五件不同的声骸")
+        ids = tuple(expected_owners)
+        slots = ", ".join("?" for _ in ids)
+        self.db.execute("BEGIN IMMEDIATE")
+        with self.db:
+            actual_owners = dict(self.db.execute(
+                f"SELECT id, coalesce(json_extract(data, '$.owner'), '') FROM echoes WHERE id IN ({slots})",
+                ids,
+            ))
+            if actual_owners.keys() != expected_owners.keys() or any(
+                actual not in (expected_owners[echo_id], owner) for echo_id, actual in actual_owners.items()
+            ):
+                raise ValueError("声骸库存或穿戴角色已变更，请重新计算搭配")
+            self.db.execute(
+                f"UPDATE echoes SET data = json_set(data, '$.owner', '') "
+                f"WHERE json_extract(data, '$.owner') = ? AND id NOT IN ({slots})",
+                (owner, *ids),
+            )
+            self.db.execute(
+                f"UPDATE echoes SET data = json_set(data, '$.owner', ?) WHERE id IN ({slots})",
+                (owner, *ids),
+            )
+
     def clear_sonata(self, sonata):
         if not sonata:
             raise ValueError("请选择要清除的合鸣套装")
