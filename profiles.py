@@ -1,10 +1,13 @@
 """Editable character starting points based on published build guides."""
 
 from dataclasses import dataclass
+from decimal import Decimal
 import json
 from pathlib import Path
+import re
 
-from rules import HSIN_SET
+from echoes import PERCENT_STATS
+from rules import ADDITIONAL_TARGETS, HSIN_SET
 
 
 ALL_SONATAS = "不限套装"
@@ -14,6 +17,7 @@ ALL_SONATAS = "不限套装"
 class EchoPreset:
     first: str
     sets: tuple
+    main_slots: tuple = ()
 
     @property
     def label(self):
@@ -35,6 +39,12 @@ class CharacterGuide:
     crit_damage: float = 0
     release_date: str = ""
     echo_presets: tuple = ()
+    attack: float = 0
+    additional_targets: tuple = ()
+    catalog_order: int = 0
+    weapon_type: str = ""
+    base_stats: dict | None = None
+    skill_bonuses: tuple | None = None
 
     @property
     def sonata_choices(self):
@@ -49,6 +59,12 @@ class CharacterGuide:
             firsts = tuple(dict.fromkeys(preset.first for preset in presets))
             return presets[0].sets, firsts
         return ((selected, 5),), ()
+
+    def main_layouts(self, selected):
+        presets = [preset for preset in self.echo_presets if preset.label == selected]
+        use_first = bool(presets) or selected == ALL_SONATAS
+        return tuple((preset.first if use_first else "", preset.main_slots)
+                     for preset in presets or self.echo_presets if preset.main_slots)
 
 
 PREVIOUS_PRESETS = {
@@ -71,9 +87,29 @@ PREVIOUS_PRESETS = {
     ),
 }
 
+def parse_skill_bonuses(nodes):
+    if not isinstance(nodes, list):
+        return None
+    totals = {}
+    for node in nodes:
+        title = node.get("PropertyNodeTitle", "").strip()
+        name = title.removesuffix("提升")
+        if name in {"攻击", "生命", "防御"}:
+            name += "%"
+        desc = node.get("PropertyNodeDescribe", "").strip()
+        match = re.fullmatch(re.escape(title) + r"\s*(\d+(?:\.\d+)?)%", desc)
+        if name not in PERCENT_STATS or not match:
+            return None
+        totals[name] = totals.get(name, Decimal(0)) + Decimal(match[1])
+    return {name: float(value) for name, value in sorted(totals.items())}
+
+
 def read_guides(filename):
     with Path(__file__).with_name(filename).open(encoding="utf-8") as snapshot:
-        data = json.load(snapshot)
+        return parse_guides(json.load(snapshot))
+
+
+def parse_guides(data):
     return {
         name: CharacterGuide(
             element=guide["element"], scaling=guide["scaling"],
@@ -82,9 +118,19 @@ def read_guides(filename):
             sonatas=tuple(guide["sonatas"]), url=guide["url"],
             energy=guide.get("energy", 0), crit_rate=guide.get("crit_rate", 0),
             crit_damage=guide.get("crit_damage", 0),
+            attack=guide.get("attack", 0),
+            additional_targets=tuple(guide.get("additional_targets", {}).items()),
             release_date=guide.get("release_date", ""),
-            echo_presets=tuple(EchoPreset(first, tuple((name, count) for name, count in sets))
-                               for first, sets in guide.get("echo_presets", ())),
+            catalog_order=guide.get("catalog_order", 0),
+            weapon_type=guide.get("weapon_type", ""),
+            base_stats=guide.get("base_stats"),
+            skill_bonuses=(tuple(guide["skill_bonuses"].items())
+                           if guide.get("skill_bonuses") is not None else None),
+            echo_presets=tuple(
+                EchoPreset(first, tuple((name, count) for name, count in sets),
+                           tuple((cost, stat) for cost, stat in (slots[0] if slots else ())))
+                for first, sets, *slots in guide.get("echo_presets", ())
+            ),
         )
         for name, guide in data.items()
     }
@@ -99,20 +145,27 @@ ROLE_ORDER = tuple(sorted(GUIDES, key=lambda name: GUIDES[name].release_date, re
 
 def guide_defaults(guide):
     defaults = {
-        "target_crit_rate": "", "target_crit_damage": "", "target_energy": "",
+        "target_crit_rate": "", "target_crit_damage": "", "target_energy": "", "target_attack": "",
         "priorities": "", "main4": "", "main3": "", "main1": "",
         "element": "导电", "scaling": "攻击", "ranking": "循环伤害",
         "required_set": ALL_SONATAS,
     }
+    defaults.update(dict.fromkeys(ADDITIONAL_TARGETS, ""))
     if guide:
         defaults.update(
-            element=guide.element, scaling=guide.scaling, ranking="推荐词条",
+            element=guide.element, scaling=guide.scaling,
+            ranking="推荐词条" if guide.priorities else "循环伤害",
             priorities=" > ".join(guide.priorities),
             target_crit_rate=f"{guide.crit_rate:g}" if guide.crit_rate else "",
             target_crit_damage=f"{guide.crit_damage:g}" if guide.crit_damage else "",
             target_energy=f"{guide.energy:g}" if guide.energy else "",
+            target_attack=f"{guide.attack:g}" if guide.attack else "",
             required_set=guide.sonata_choices[0] if guide.sonata_choices else ALL_SONATAS,
         )
         for cost, stats in guide.mains:
             defaults[f"main{cost}"] = " / ".join(stats)
+        additional = dict(guide.additional_targets)
+        for key, name in ADDITIONAL_TARGETS.items():
+            if additional.get(name):
+                defaults[key] = f"{additional[name]:g}"
     return defaults

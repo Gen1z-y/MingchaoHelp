@@ -140,6 +140,15 @@ class Inventory:
                 (owner, *ids),
             )
 
+    def unequip(self, owner):
+        if not owner.strip() or owner in {UNKNOWN_OWNER, "装配中（待确认）"}:
+            raise ValueError("请选择有效的穿戴角色")
+        with self.db:
+            return self.db.execute(
+                "UPDATE echoes SET data = json_set(data, '$.owner', '') "
+                "WHERE json_extract(data, '$.owner') = ?", (owner,),
+            ).rowcount
+
     def clear_sonata(self, sonata):
         if not sonata:
             raise ValueError("请选择要清除的合鸣套装")

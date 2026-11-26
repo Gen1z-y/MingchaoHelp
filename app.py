@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 from queue import Empty, Queue
 import sqlite3
-from threading import Event, Thread
+from threading import Thread
 from time import sleep
 import sys
 import tkinter as tk
@@ -15,12 +15,13 @@ import webbrowser
 
 from app_paths import LOCAL_DATA
 from auto_scan import COLUMNS, ScanJob, migrate_anchors, worker
-from capture import capture_game, collect_with_hotkey
 from echoes import Inventory, PERCENT_STATS, STAT_NAMES, UNKNOWN_OWNER
+from guide_sync import read_cached_guides, sync_guides
 from ingest import Reader, ReadResult
-from optimizer import Profile, evaluate, solve
-from profiles import ALL_SONATAS, GUIDES, OFFICIAL_GUIDES, PREVIOUS_GUIDES, ROLE_ORDER, guide_defaults
-from rules import SETS
+from optimizer import PANEL_BASES, Profile, evaluate, solve
+from profiles import ALL_SONATAS, FALLBACK_GUIDES, OFFICIAL_GUIDES, PREVIOUS_GUIDES, ROLE_ORDER, guide_defaults
+from rules import ADDITIONAL_TARGETS, SETS
+from weapons import CHARACTER_PANELS, NO_WEAPON, WEAPONS, WEAPONS_BY_ID, CharacterPanel
 from scanner import SONATA_NAMES
 
 
@@ -34,14 +35,27 @@ MUTED = "#a8b9ce"
 ACCENT = "#76e1c6"
 ACCENT_TEXT = "#102e2b"
 BUILD_BORDER = "#eb6670"
+INVENTORY_FILTERS = {"按角色": "owner", "按套装": "sonata"}
 FONT = ("Microsoft YaHei UI", 10)
-TARGETS = (("target_crit_rate", "暴击目标 %"), ("target_crit_damage", "暴伤目标 %"),
-           ("target_energy", "共鸣效率目标 %"))
+TARGETS = (("target_crit_rate", "暴击 %"), ("target_crit_damage", "暴伤 %"),
+           ("target_energy", "共鸣效率 %"), ("target_attack", "攻击"))
+TARGET_LABELS = dict(TARGETS) | {
+    key: f"{stat}{' %' if stat in PERCENT_STATS else ''}"
+    for key, stat in ADDITIONAL_TARGETS.items()
+}
 
 
-def display_stats(stats):
-    return "\n".join(f"{name.removesuffix('%')} {value:g}{'%' if name in PERCENT_STATS else ''}"
+def display_stats(stats, separator="\n"):
+    return separator.join(f"{name.removesuffix('%')} {value:g}{'%' if name in PERCENT_STATS else ''}"
                      for name, value in stats)
+
+
+def display_main_slots(slots):
+    costs = {}
+    for (cost, stat), count in Counter(slots).items():
+        name = f"{stat} ×{count}" if count > 1 else stat
+        costs.setdefault(cost, []).append(name)
+    return " · ".join(f"{cost} COST {' + '.join(names)}" for cost, names in costs.items())
 
 
 def setup_theme(root):
@@ -56,7 +70,6 @@ def setup_theme(root):
     style.configure(".", font=FONT, background=BG, foreground=TEXT)
     style.configure("TFrame", background=BG)
     style.configure("Card.TFrame", background=PANEL)
-    style.configure("Card.TCheckbutton", background=PANEL)
     style.configure("TLabel", background=BG, foreground=TEXT)
     style.configure("Title.TLabel", font=(FONT[0], 24, "bold"))
     style.configure("Section.TLabel", background=PANEL, font=(FONT[0], 13, "bold"))
@@ -71,7 +84,15 @@ def setup_theme(root):
     style.configure("EchoMeta.TLabel", background=ROW, foreground=MUTED)
     style.configure("TButton", background=ROW, bordercolor=EDGE, lightcolor=ROW,
                     darkcolor=ROW, padding=(14, 8), foreground=TEXT, focusthickness=1)
-    style.map("TButton", background=[("active", "#304660"), ("pressed", "#263850")])
+    button_fill = [("pressed", "#263850"), ("active", "#304660")]
+    style.map("TButton", background=button_fill)
+    style.configure("Inventory.TButton", padding=(8, 8))
+    style.configure("Card.TCheckbutton", background=PANEL, foreground=TEXT,
+                    indicatorbackground=ROW, indicatorforeground=ACCENT_TEXT,
+                    upperbordercolor=MUTED, lowerbordercolor=MUTED, padding=(5, 3))
+    style.map("Card.TCheckbutton", background=button_fill,
+              foreground=[("disabled", MUTED), ("active", TEXT)],
+              indicatorbackground=[("selected", ACCENT)])
     style.configure("Primary.TButton", background=ACCENT, foreground=ACCENT_TEXT,
                     lightcolor=ACCENT, darkcolor=ACCENT, bordercolor=ACCENT,
                     font=(FONT[0], 10, "bold"), padding=(19, 9))
@@ -79,11 +100,12 @@ def setup_theme(root):
               foreground=[("active", ACCENT_TEXT)])
     style.configure("TMenubutton", background=ROW, foreground=TEXT, bordercolor=EDGE,
                     lightcolor=ROW, darkcolor=ROW, padding=(13, 8), arrowcolor=TEXT)
-    menu_fill = [("pressed", "#263850"), ("active", "#304660")]
-    style.map("TMenubutton", background=menu_fill, lightcolor=menu_fill, darkcolor=menu_fill,
+    style.map("TMenubutton", background=button_fill, lightcolor=button_fill, darkcolor=button_fill,
               foreground=[("pressed", TEXT), ("active", TEXT)],
               arrowcolor=[("pressed", TEXT), ("active", TEXT)],
               bordercolor=[("pressed", EDGE), ("active", EDGE), ("focus", "#7d9ab5")])
+    style.configure("Inline.TMenubutton", padding=(9, 4))
+    style.configure("Card.TSeparator", background=EDGE)
     style.layout("Page.TRadiobutton", [
         ("Button.border", {"sticky": "nswe", "children": [
             ("Button.padding", {"sticky": "nswe", "children": [
@@ -202,6 +224,8 @@ class Window:
     def __init__(self, root):
         self.root = root
         root.title("MingchaoHelp · 鸣潮助手")
+        if sys.platform == "win32":
+            root.iconbitmap(default=str(Path(__file__).with_name("assets") / "mingchaohelp.ico"))
         root.geometry("1120x760")
         root.minsize(940, 660)
         root.protocol("WM_DELETE_WINDOW", self.close)
@@ -210,11 +234,12 @@ class Window:
         self.inventory.clean_deleted_cards()
         self.result_queue = Queue()
         self.progress = Queue()
-        self.capture_stop = None
         self.auto_job = None
         self.busy = False
         self.echoes = {}
         self.status = tk.StringVar(value="准备就绪")
+        self.guide_cache = LOCAL / "kuro-guides"
+        self.apply_guide_catalog(read_cached_guides(self.guide_cache))
 
         header = ttk.Frame(root, padding=(24, 17, 24, 9))
         header.pack(fill="x")
@@ -243,9 +268,49 @@ class Window:
                       "optimizer": self.build_optimizer_tab()}
         self.show_page()
         self.refresh()
+        self.root.after(1000, self.start_guide_sync)
         if any((LOCAL / "pending").glob("*.png")) or any((LOCAL / "captures").glob("*.png")) or any(
                 (LOCAL / "icons").glob("*.png")) or any((LOCAL / "auto-scan").glob("*/start.png")):
             self.root.after(100, self.migrate)
+
+    def apply_guide_catalog(self, cached):
+        cached = {name: guide for name, guide in cached.items() if name not in OFFICIAL_GUIDES}
+        self.official_guides = OFFICIAL_GUIDES | cached
+        self.guides = FALLBACK_GUIDES | self.official_guides
+        self.guide_sonatas = set(SONATA_NAMES) | {sonata for guide in cached.values() for sonata in guide.sonatas}
+        new_order = sorted(cached, key=lambda name: cached[name].catalog_order, reverse=True)
+        self.role_order = tuple(dict.fromkeys((*new_order, *ROLE_ORDER)))
+        self.character_panels = CHARACTER_PANELS | {
+            name: CharacterPanel(guide.weapon_type, guide.base_stats, guide.skill_bonuses)
+            for name, guide in cached.items() if guide.weapon_type and guide.base_stats
+        }
+
+    def start_guide_sync(self):
+        result_queue = Queue()
+
+        def worker():
+            try:
+                result_queue.put(sync_guides(self.guide_cache))
+            except (OSError, ValueError, TypeError, AttributeError):
+                result_queue.put((None, True))
+
+        def receive():
+            try:
+                cached, pending = result_queue.get_nowait()
+            except Empty:
+                self.root.after(250, receive)
+                return
+            if cached is not None:
+                added = cached.keys() - self.official_guides.keys()
+                self.apply_guide_catalog(cached)
+                self.role_choice.set_choices((*self.role_order, *self.role_settings))
+                if added and not self.busy:
+                    self.status.set("已收录库洛攻略 · " + "、".join(sorted(added)))
+            hours = 0.5 if pending else 6
+            self.root.after(int(hours * 60 * 60 * 1000), self.start_guide_sync)
+
+        Thread(target=worker, daemon=True).start()
+        self.root.after(250, receive)
 
     def show_page(self):
         selected = self.selected_page.get()
@@ -271,14 +336,6 @@ class Window:
                                       style="Primary.TButton")
         self.auto_button.pack(side="right")
         ttk.Button(toolbar, text="导入截图", command=self.import_images).pack(side="right", padx=8)
-        more = ttk.Menubutton(toolbar, text="其他采集")
-        more_menu = tk.Menu(more, tearoff=False, background=PANEL, foreground=TEXT,
-                            activebackground=ROW, activeforeground=TEXT,
-                            borderwidth=0, activeborderwidth=0, relief="flat")
-        more_menu.add_command(label="3 秒后抓取当前声骸", command=self.capture)
-        more_menu.add_command(label="开启或结束快捷键采集", command=self.toggle_capture)
-        more.configure(menu=more_menu)
-        more.pack(side="right")
 
         listing = ttk.Frame(tab, padding=(14, 12), style="Card.TFrame")
         listing.grid(row=1, column=0, sticky="nsew", padx=(0, 14))
@@ -287,14 +344,25 @@ class Window:
 
         table_header = ttk.Frame(listing, style="Card.TFrame")
         table_header.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 11))
-        ttk.Label(table_header, text="已入库", style="Section.TLabel").pack(side="left")
+        actions = ttk.Frame(table_header, style="Card.TFrame")
+        actions.pack(fill="x")
+        ttk.Label(actions, text="已入库", style="Section.TLabel").pack(side="left")
         self.count = tk.StringVar()
-        ttk.Label(table_header, textvariable=self.count, style="Count.TLabel").pack(side="left", padx=10)
-        ttk.Button(table_header, text="按套装清除", command=self.choose_sonata_to_clear).pack(side="left")
+        ttk.Label(actions, textvariable=self.count, style="Count.TLabel").pack(side="left", padx=8)
+        ttk.Button(actions, text="按套装清除", command=self.choose_sonata_to_clear,
+                   style="Inventory.TButton").pack(side="left")
+        self.unequip_button = ttk.Button(actions, text="按角色卸下", command=self.choose_role_to_unequip,
+                                         style="Inventory.TButton")
+        self.unequip_button.pack(side="left", padx=(8, 0))
+
+        ttk.Label(actions, text="查找", style="Hint.TLabel").pack(side="left", padx=(8, 4))
+        self.filter_mode = tk.StringVar(value="按角色")
+        ttk.Combobox(actions, textvariable=self.filter_mode, values=tuple(INVENTORY_FILTERS),
+                     state="readonly", width=7).pack(side="left", fill="y", padx=(0, 6))
         self.filter_text = tk.StringVar()
-        query = ttk.Entry(table_header, textvariable=self.filter_text, width=20)
-        query.pack(side="right")
-        ttk.Label(table_header, text="查找", style="Hint.TLabel").pack(side="right", padx=8)
+        self.inventory_query = SearchCombobox(actions, self.filter_text, label="查找",
+                                              on_error=self.status.set, allow_custom=True, width=12)
+        self.inventory_query.pack(side="left", fill="both", expand=True)
 
         columns = [("name", "声骸", 164), ("cost", "COST", 53), ("level", "等级", 55),
                    ("sonata", "合鸣套装", 134), ("owner", "穿戴角色", 106)]
@@ -312,6 +380,7 @@ class Window:
         scrollbar.grid(row=1, column=1, sticky="ns")
         self.tree.bind("<<TreeviewSelect>>", self.show_echo)
         self.filter_text.trace_add("write", lambda *_: self.render_inventory())
+        self.filter_mode.trace_add("write", self.update_inventory_filter)
         review_bar = ttk.Frame(listing, style="Card.TFrame")
         review_bar.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         self.review_only = tk.BooleanVar()
@@ -359,11 +428,18 @@ class Window:
             self.failure_button.pack(side="right")
         else:
             self.failure_button.pack_forget()
+        self.update_inventory_filter()
+
+    def update_inventory_filter(self, *_):
+        field = INVENTORY_FILTERS[self.filter_mode.get()]
+        choices = {getattr(echo, field) for echo in self.echoes.values()}
+        self.inventory_query.set_choices(sorted(choices - {""}))
         self.render_inventory()
 
     def render_inventory(self):
         selected = self.tree.selection()
-        query = self.filter_text.get().strip().casefold()
+        query = SearchCombobox.search_key(self.filter_text.get())
+        field = INVENTORY_FILTERS[self.filter_mode.get()]
         y = self.tree.yview()
         self.tree.delete(*self.tree.get_children())
         shown = 0
@@ -371,7 +447,7 @@ class Window:
         for echo in self.echoes.values():
             if review_only and not echo.needs_review:
                 continue
-            if query and query not in f"{echo.name} {echo.sonata} {echo.owner}".casefold():
+            if query and query not in SearchCombobox.search_key(getattr(echo, field)):
                 continue
             tags = ("odd",) if shown % 2 else ()
             if echo.needs_review:
@@ -403,21 +479,39 @@ class Window:
             panel.set(display_stats(getattr(echo, key)) or "—" if echo else "—")
         self.detail.set(" · ".join(echo.warnings) if echo else "")
 
+    def new_dialog(self, title, *, resizable=False):
+        dialog = tk.Toplevel(self.root)
+        dialog.withdraw()
+        dialog.title(title)
+        dialog.transient(self.root)
+        dialog.resizable(resizable, resizable)
+        dialog.bind("<Escape>", lambda _: dialog.destroy())
+        return dialog
+
+    def show_dialog(self, dialog, *, size=None, modal=True, focus=None):
+        dialog.update_idletasks()
+        width, height = size or (dialog.winfo_reqwidth(), dialog.winfo_reqheight())
+        x = self.root.winfo_x() + (self.root.winfo_width() - width) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - height) // 2
+        dimensions = f"{width}x{height}" if size else ""
+        dialog.geometry(f"{dimensions}+{x}+{y}")
+        dialog.deiconify()
+        if modal:
+            dialog.grab_set()
+        if focus:
+            focus.focus_set()
+
     def edit_selected_echo(self):
         selection = self.tree.selection()
         if self.busy or not selection:
             return
         echo = self.echoes[selection[0]]
-        dialog = tk.Toplevel(self.root)
-        dialog.title("编辑声骸")
-        dialog.transient(self.root)
-        dialog.resizable(False, False)
-        dialog.bind("<Escape>", lambda _: dialog.destroy())
+        dialog = self.new_dialog("编辑声骸")
         form = ttk.Frame(dialog, padding=16)
         form.pack(fill="both", expand=True)
         fields = {}
-        sonatas = sorted(set(SONATA_NAMES) | {entry.sonata for entry in self.echoes.values()})
-        roles = tuple(dict.fromkeys(("", UNKNOWN_OWNER, *ROLE_ORDER, *self.role_settings)))
+        sonatas = sorted(self.guide_sonatas | {entry.sonata for entry in self.echoes.values()})
+        roles = tuple(dict.fromkeys(("", UNKNOWN_OWNER, *self.role_order, *self.role_settings)))
         metadata = (
             ("name", "名称", echo.name, ()),
             ("sonata", "合鸣套装", echo.sonata, sonatas),
@@ -487,17 +581,13 @@ class Window:
 
         ttk.Button(form, text="保存修正", command=save, style="Primary.TButton").grid(
             row=14, column=1, columnspan=2, sticky="e", pady=(8, 0))
-        dialog.grab_set()
+        self.show_dialog(dialog)
 
     def show_scan_failures(self):
         failures = self.inventory.recent_failures()
         if not failures:
             return
-        dialog = tk.Toplevel(self.root)
-        dialog.title("扫描异常")
-        dialog.transient(self.root)
-        dialog.geometry("650x390")
-        dialog.bind("<Escape>", lambda _: dialog.destroy())
+        dialog = self.new_dialog("扫描异常", resizable=True)
         form = ttk.Frame(dialog, padding=16)
         form.pack(fill="both", expand=True)
         description = "可按扫描时的背包排序和筛选定位补扫，也可导入单件详情截图。"
@@ -519,6 +609,7 @@ class Window:
                 label = "详情截图"
             entries.insert("end", f"{label}  ·  {reason}\n\n")
         entries.configure(state="disabled")
+        self.show_dialog(dialog, size=(650, 390), modal=False)
 
     def choose_sonata_to_clear(self):
         if self.busy:
@@ -530,10 +621,7 @@ class Window:
         selected = self.tree.selection()
         echo = self.echoes.get(selected[0]) if selected else None
         names = sorted(counts)
-        dialog = tk.Toplevel(self.root)
-        dialog.title("按合鸣套装清除")
-        dialog.transient(self.root)
-        dialog.resizable(False, False)
+        dialog = self.new_dialog("按合鸣套装清除")
         form = ttk.Frame(dialog, padding=16)
         form.pack(fill="both", expand=True)
         sonata = tk.StringVar(value=echo.sonata if echo else names[0])
@@ -588,8 +676,55 @@ class Window:
 
         ttk.Button(form, text="取消", command=dialog.destroy).grid(row=2, column=0, sticky="e")
         ttk.Button(form, text="清除套装", command=clear).grid(row=2, column=1, sticky="e")
-        dialog.grab_set()
-        choice.focus_set()
+        self.show_dialog(dialog, focus=choice)
+
+    def choose_role_to_unequip(self):
+        if self.busy:
+            return
+        counts = Counter(echo.owner for echo in self.echoes.values()
+                         if echo.owner and echo.owner != UNKNOWN_OWNER)
+        if not counts:
+            self.status.set("库存里没有已绑定角色的声骸")
+            return
+        selected = self.tree.selection()
+        echo = self.echoes.get(selected[0]) if selected else None
+        default = echo.owner if echo and echo.owner in counts else ""
+
+        dialog = self.new_dialog("按角色卸下")
+        form = ttk.Frame(dialog, padding=16)
+        form.pack(fill="both", expand=True)
+        owner = tk.StringVar(value=default)
+        notice = tk.StringVar()
+        ttk.Label(form, text="穿戴角色").grid(row=0, column=0, sticky="w", padx=(0, 10))
+        choice = SearchCombobox(form, owner, sorted(counts), label="穿戴角色",
+                                 on_error=notice.set, width=23)
+        choice.grid(row=0, column=1, sticky="ew")
+        ttk.Label(form, textvariable=notice).grid(row=1, column=0, columnspan=2, sticky="w", pady=(9, 12))
+
+        def show_count(*_):
+            name = owner.get()
+            notice.set(f"将解除 {counts[name]:,} 件声骸的穿戴绑定" if name in counts else "请选择已穿戴声骸的角色")
+
+        show_count()
+        trace = owner.trace_add("write", show_count)
+        dialog.bind("<Destroy>", lambda event: owner.trace_remove("write", trace)
+                    if event.widget is dialog else None)
+
+        def unequip():
+            try:
+                name = choice.resolve()
+                count = self.inventory.unequip(name)
+            except (ValueError, sqlite3.Error) as error:
+                notice.set(str(error))
+                return
+            dialog.destroy()
+            self.refresh()
+            self.set_output("穿戴已更新，请重新计算搭配。")
+            self.status.set(f"已卸下「{name}」的 {count:,} 件声骸" if count else f"「{name}」没有已绑定的声骸")
+
+        ttk.Button(form, text="取消", command=dialog.destroy).grid(row=2, column=0, sticky="w")
+        ttk.Button(form, text="卸下声骸", command=unequip, style="Primary.TButton").grid(row=2, column=1, sticky="e")
+        self.show_dialog(dialog, focus=choice)
 
     def run(self, task, callback, on_error=None):
         self.busy = True
@@ -645,7 +780,7 @@ class Window:
     def import_images(self):
         if self.busy:
             return
-        paths = filedialog.askopenfilenames(title="选择声骸详情截图",
+        paths = filedialog.askopenfilenames(parent=self.root, title="选择声骸详情截图",
                                             filetypes=[("图片", "*.png *.jpg *.jpeg *.webp *.bmp")])
         if paths:
             self.read_images(tuple(Path(path) for path in paths))
@@ -668,42 +803,6 @@ class Window:
         failed = result.count(ReadResult.FAILED)
         self.status.set(f"已入库 +25 声骸 {saved} 件 · 跳过 {skipped} 件 · 识别失败 {failed} 件")
 
-    def capture(self):
-        if self.busy:
-            return
-        self.busy = True
-        self.status.set("3 秒后截图 · 请切回鸣潮并选中一件声骸")
-        self.root.after(3000, self.capture_current)
-
-    def capture_current(self):
-        def task():
-            with Reader(LOCAL) as reader:
-                return [reader.record(capture_game())]
-
-        self.run(task, self.read_finished)
-
-    def toggle_capture(self):
-        if self.capture_stop:
-            self.capture_stop.set()
-            return
-        if self.busy:
-            return
-        stop = Event()
-        self.capture_stop = stop
-
-        def task():
-            with Reader(LOCAL) as reader:
-                return collect_with_hotkey(stop, self.progress.put, reader.record)
-
-        def reset():
-            self.capture_stop = None
-
-        def finished(result):
-            reset()
-            self.read_finished(result)
-
-        self.run(task, finished, reset)
-
     def toggle_auto_scan(self):
         if self.auto_job:
             self.auto_job.stop_flag.touch()
@@ -716,6 +815,7 @@ class Window:
             resume = messagebox.askyesnocancel(
                 "继续自动扫描",
                 "发现未完成的扫描。选择「是」从上次位置继续，「否」从头扫描。",
+                parent=self.root,
             )
             if resume is None:
                 return
@@ -776,7 +876,7 @@ class Window:
         self.run(execute, finished, reset)
         self.root.after(250, poll)
 
-    optimizer_prompt = "选择角色和合鸣套装，按需填写目标，再点击「开始计算」。"
+    optimizer_prompt = "选择角色、武器和合鸣套装，再点击「开始计算」。"
 
     def build_optimizer_tab(self):
         tab = ttk.Frame(self.content)
@@ -785,39 +885,76 @@ class Window:
 
         overview = ttk.Frame(tab, style="Card.TFrame", padding=(16, 12))
         overview.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 12))
-        overview.columnconfigure(8, weight=1)
+        overview.columnconfigure(0, weight=1)
+        selection = ttk.Frame(overview, style="Card.TFrame")
+        selection.grid(row=0, column=0, sticky="ew")
+        for column, weight in enumerate((2, 3, 3, 3)):
+            selection.columnconfigure(column, weight=weight)
+        for column, title in ((0, "角色"), (2, "合鸣套装"), (3, "首位声骸")):
+            ttk.Label(selection, text=title, style="Hint.TLabel").grid(
+                row=0, column=column, sticky="w", pady=(0, 4))
+
         self.profile = {}
-        ttk.Label(overview, text="角色", style="Card.TLabel").grid(row=0, column=0, padx=(0, 6))
         self.profile["name"] = tk.StringVar(value="心")
         self.role_choice = SearchCombobox(
-            overview, self.profile["name"], ROLE_ORDER, label="角色", allow_custom=True,
-            on_select=self.load_role, on_error=self.status.set, width=10)
-        self.role_choice.grid(row=0, column=1, padx=(0, 14))
-        for column, (key, title) in zip((2, 4, 6), TARGETS):
-            value = tk.StringVar()
-            self.profile[key] = value
-            ttk.Label(overview, text=title, style="Card.TLabel").grid(row=0, column=column, padx=(0, 6))
-            ttk.Entry(overview, textvariable=value, width=7).grid(row=0, column=column + 1, padx=(0, 12))
-        ttk.Button(overview, text="开始计算", command=self.search, style="Primary.TButton").grid(
-            row=0, column=9, sticky="e")
-        self.source_button = ttk.Button(overview, text="查看攻略", command=self.open_role_guide)
-        self.source_button.grid(row=0, column=8, sticky="e", padx=(0, 8))
+            selection, self.profile["name"], self.role_order, label="角色", allow_custom=True,
+            on_select=self.load_role, on_error=self.status.set, width=11)
+        self.role_choice.grid(row=1, column=0, sticky="new", padx=(0, 14))
+
+        weapon_header = ttk.Frame(selection, style="Card.TFrame")
+        weapon_header.grid(row=0, column=1, sticky="w", pady=(0, 4))
+        ttk.Label(weapon_header, text="武器", style="Hint.TLabel").pack(side="left")
+        self.weapon_level = tk.StringVar()
+        ttk.Label(weapon_header, textvariable=self.weapon_level, style="Hint.TLabel").pack(side="left", padx=(8, 0))
+        self.weapon_choice = SearchCombobox(
+            selection, tk.StringVar(value=NO_WEAPON), label="武器",
+            on_error=self.status.set, on_select=self.update_weapon_level, width=21)
+        self.weapon_choice.grid(row=1, column=1, sticky="new", padx=(0, 14))
+
         self.profile["required_set"] = tk.StringVar()
-        ttk.Label(overview, text="合鸣套装", style="Card.TLabel").grid(
-            row=1, column=0, sticky="w", padx=(0, 6), pady=(8, 0))
-        set_var = self.profile["required_set"]
         self.sonata_choice = SearchCombobox(
-            overview, set_var, label="合鸣套装", on_error=self.status.set,
-            on_select=self.update_first_echo, width=25)
-        self.sonata_choice.grid(row=1, column=1, columnspan=3, sticky="w", pady=(8, 0))
+            selection, self.profile["required_set"], label="合鸣套装", on_error=self.status.set,
+            on_select=self.update_first_echo, width=23)
+        self.sonata_choice.grid(row=1, column=2, sticky="new", padx=(0, 14))
         self.first_echo_text = tk.StringVar()
-        ttk.Label(overview, textvariable=self.first_echo_text, style="Card.TLabel",
-                  wraplength=395).grid(row=1, column=4, columnspan=6, sticky="w", padx=(10, 0), pady=(8, 0))
+        ttk.Label(selection, textvariable=self.first_echo_text, style="Card.TLabel",
+                  wraplength=210, padding=(0, 6)).grid(row=1, column=3, sticky="nw")
+
+        goals = ttk.Frame(overview, style="Card.TFrame")
+        goals.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        goals.columnconfigure(1, weight=1)
+        ttk.Label(goals, text="面板目标", style="Hint.TLabel", padding=(0, 6)).grid(
+            row=0, column=0, sticky="nw", padx=(0, 14))
+        self.target_fields = ttk.Frame(goals, style="Card.TFrame", height=32)
+        self.target_fields.grid(row=0, column=1, sticky="ew")
+        self.target_fields.bind("<Configure>", lambda event: self.layout_target_fields(event.width))
+        self.target_widgets = {}
+        for key, title in TARGET_LABELS.items():
+            self.profile[key] = tk.StringVar()
+            field = ttk.Frame(self.target_fields, style="Card.TFrame")
+            ttk.Label(field, text=title, style="Card.TLabel").pack(side="left", padx=(0, 6))
+            entry = ttk.Entry(field, textvariable=self.profile[key], width=7, justify="right")
+            entry.pack(side="left")
+            self.target_widgets[key] = field, entry
+        self.add_target_button = ttk.Menubutton(self.target_fields, text="添加目标", style="Inline.TMenubutton")
+        self.add_target_menu = tk.Menu(self.add_target_button, tearoff=False)
+        self.add_target_button.configure(menu=self.add_target_menu)
+
+        ttk.Separator(overview, style="Card.TSeparator").grid(row=2, column=0, sticky="ew", pady=(10, 8))
+        footer = ttk.Frame(overview, style="Card.TFrame")
+        footer.grid(row=3, column=0, sticky="ew")
+        footer.columnconfigure(0, weight=1)
         self.guide_description = tk.StringVar()
-        ttk.Label(overview, textvariable=self.guide_description, style="Hint.TLabel",
-                  wraplength=625).grid(row=2, column=0, columnspan=8, sticky="w", pady=(7, 0))
-        self.reset_button = ttk.Button(overview, text="恢复攻略推荐", command=self.reset_role_guide)
-        self.reset_button.grid(row=2, column=8, columnspan=2, sticky="e", pady=(7, 0))
+        hint = ttk.Label(footer, textvariable=self.guide_description, style="Hint.TLabel", wraplength=360)
+        hint.grid(row=0, column=0, sticky="ew", padx=(0, 14))
+        hint.bind("<Configure>", lambda event: hint.configure(wraplength=event.width))
+        actions = ttk.Frame(footer, style="Card.TFrame")
+        actions.grid(row=0, column=1, sticky="e")
+        self.source_button = ttk.Button(actions, text="查看攻略", command=self.open_role_guide)
+        self.source_button.pack(side="left", padx=(0, 8))
+        self.reset_button = ttk.Button(actions, text="恢复攻略推荐", command=self.reset_role_guide)
+        self.reset_button.pack(side="left", padx=(0, 8))
+        ttk.Button(actions, text="开始计算", command=self.search, style="Primary.TButton").pack(side="left")
 
         self.output = tk.Canvas(tab, background=PANEL, highlightthickness=0,
                                 borderwidth=0, width=0, yscrollincrement=24)
@@ -835,7 +972,7 @@ class Window:
             self.role_settings = json.loads(self.profile_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             self.role_settings = {}
-        self.role_choice.set_choices((*ROLE_ORDER, *self.role_settings))
+        self.role_choice.set_choices((*self.role_order, *self.role_settings))
         self.load_role()
         self.set_output(self.optimizer_prompt)
         return tab
@@ -844,23 +981,20 @@ class Window:
         name = self.profile["name"].get().strip()
         self.role_choice.commit(name)
         self.loaded_role = name
-        guide = GUIDES.get(name)
-        source = "库洛攻略站" if name in OFFICIAL_GUIDES else "查看攻略"
+        guide = self.guides.get(name)
+        source = "库洛攻略站" if name in self.official_guides else "查看攻略"
         state = "normal" if guide else "disabled"
         self.source_button.configure(text=source, state=state)
-        reset = "恢复官方推荐" if name in OFFICIAL_GUIDES else "恢复攻略推荐"
+        reset = "恢复官方推荐" if name in self.official_guides else "恢复攻略推荐"
         self.reset_button.configure(text=reset, state=state)
-        if guide:
-            main = "  ·  ".join(f"{cost} COST {' / '.join(stats)}" for cost, stats in guide.mains)
-            self.guide_description.set(main)
-        else:
-            self.guide_description.set("自定义角色 · 可设置暴击、暴伤和共鸣效率目标")
-        self.apply_role_fields(guide_defaults(guide), self.saved_role_settings(name))
+        saved = self.saved_role_settings(name)
+        self.apply_role_fields(guide_defaults(guide), saved)
+        self.load_weapon(name, saved.get("weapon_id"))
 
     def saved_role_settings(self, name):
         saved = self.role_settings.get(name, {})
         previous = PREVIOUS_GUIDES.get(name)
-        if GUIDES.get(name) != previous and saved and not saved.get("uses_guide_defaults"):
+        if self.guides.get(name) != previous and saved and not saved.get("uses_guide_defaults"):
             previous_defaults = guide_defaults(previous)
             previous_defaults.pop("required_set")
             saved = {key: value for key, value in saved.items() if value != previous_defaults.get(key)}
@@ -868,11 +1002,60 @@ class Window:
 
     def apply_role_fields(self, defaults, overrides=None):
         overrides = overrides or {}
-        for key, _ in TARGETS:
+        for key in TARGET_LABELS:
             self.profile[key].set(overrides.get(key, defaults[key]))
+        self.show_target_fields({key for key in TARGET_LABELS if self.profile[key].get().strip()})
         self.sonata_choice.commit(overrides.get("required_set") or defaults["required_set"])
         self.update_sonata_choices()
         self.update_first_echo()
+
+    def show_target_fields(self, active):
+        self.active_targets = active
+        self.add_target_menu.delete(0, "end")
+        for key, (field, _) in self.target_widgets.items():
+            if key not in active:
+                field.place_forget()
+                self.add_target_menu.add_command(label=TARGET_LABELS[key],
+                                                 command=lambda key=key: self.add_target_field(key))
+        self.add_target_button.state(["disabled"] if len(active) == len(TARGET_LABELS) else ["!disabled"])
+        self.layout_target_fields(self.target_fields.winfo_width())
+
+    def layout_target_fields(self, available_width):
+        if available_width <= 1:
+            return
+        widgets = [field for key, (field, _) in self.target_widgets.items() if key in self.active_targets]
+        widgets.append(self.add_target_button)
+        row_height = max(widget.winfo_reqheight() for widget in widgets)
+        x = y = 0
+        for widget in widgets:
+            width = widget.winfo_reqwidth()
+            if x and x + width > available_width:
+                x = 0
+                y += row_height + 6
+            widget.place(x=x, y=y + (row_height - widget.winfo_reqheight()) // 2)
+            x += width + 14
+        height = y + row_height
+        if int(self.target_fields.cget("height")) != height:
+            self.target_fields.configure(height=height)
+
+    def add_target_field(self, key):
+        self.show_target_fields(self.active_targets | {key})
+        self.target_widgets[key][1].focus_set()
+
+    def load_weapon(self, name, weapon_id):
+        character = self.character_panels.get(name)
+        guide = self.guides.get(name)
+        weapon_type = character.weapon_type if character else (guide.weapon_type if guide else "")
+        choices = (NO_WEAPON, *(weapon.name for weapon in WEAPONS.values()
+                               if not weapon_type or weapon.weapon_type == weapon_type))
+        selected = WEAPONS_BY_ID.get(weapon_id)
+        self.weapon_choice.set_choices(choices)
+        self.weapon_choice.commit(selected.name if selected and selected.name in choices else NO_WEAPON)
+        self.update_weapon_level()
+
+    def update_weapon_level(self):
+        weapon = WEAPONS.get(self.weapon_choice.committed)
+        self.weapon_level.set(f"{weapon.level} 级 · 一阶" if weapon else "")
 
     def reset_role_guide(self):
         if self.busy:
@@ -882,7 +1065,7 @@ class Window:
         except ValueError as error:
             self.status.set(str(error))
             return
-        guide = GUIDES.get(name)
+        guide = self.guides.get(name)
         if not guide:
             self.status.set("该角色暂无攻略推荐")
             return
@@ -890,7 +1073,10 @@ class Window:
         if name != self.loaded_role:
             self.load_role()
         self.apply_role_fields(guide_defaults(guide))
+        weapon = WEAPONS.get(self.weapon_choice.committed)
         self.role_settings[name] = {"uses_guide_defaults": True}
+        if weapon:
+            self.role_settings[name]["weapon_id"] = weapon.id
         self.set_output(self.optimizer_prompt)
         try:
             self.save_role_settings()
@@ -905,21 +1091,33 @@ class Window:
         temporary.replace(self.profile_path)
 
     def update_sonata_choices(self):
-        guide = GUIDES.get(self.loaded_role)
+        guide = self.guides.get(self.loaded_role)
         recommended = guide.sonata_choices if guide else ()
-        known = set(SONATA_NAMES) | {echo.sonata for echo in self.echoes.values()
+        known = self.guide_sonatas | {echo.sonata for echo in self.echoes.values()
                                      if echo.sonata != "未识别"}
         selected = self.sonata_choice.committed
         choices = dict.fromkeys((*recommended, ALL_SONATAS, *sorted(known), selected))
         self.sonata_choice.set_choices(choices)
 
     def update_first_echo(self):
-        guide = GUIDES.get(self.loaded_role)
-        _, firsts = guide.echo_setup(self.sonata_choice.committed) if guide else ((), ())
-        self.first_echo_text.set("首位声骸  " + (" / ".join(firsts) if firsts else "自动选择"))
+        guide = self.guides.get(self.loaded_role)
+        selected = self.sonata_choice.committed
+        _, firsts = guide.echo_setup(selected) if guide else ((), ())
+        self.first_echo_text.set(" / ".join(firsts) if firsts else "自动选择")
+        layouts = guide.main_layouts(selected) if guide else ()
+        summaries = tuple(dict.fromkeys(display_main_slots(slots) for _, slots in layouts))
+        if summaries:
+            self.guide_description.set("\n".join(
+                ("主词条  " if index == 0 else "备选  ") + text
+                for index, text in enumerate(summaries)
+            ))
+        else:
+            self.guide_description.set("  ·  ".join(
+                f"{cost} COST {' / '.join(stats)}" for cost, stats in (guide.mains if guide else ())
+            ))
 
     def open_role_guide(self):
-        guide = GUIDES.get(self.profile["name"].get().strip())
+        guide = self.guides.get(self.profile["name"].get().strip())
         if guide:
             webbrowser.open(guide.url)
 
@@ -934,20 +1132,29 @@ class Window:
             selected = self.sonata_choice.resolve()
             self.sonata_choice.commit(selected)
             required_set = "" if selected == ALL_SONATAS else selected
-            settings = {key: self.profile[key].get().strip() for key, _ in TARGETS}
-            targets = {key: float(value or 0) for key, value in settings.items()}
+            weapon_name = self.weapon_choice.resolve()
+            self.weapon_choice.commit(weapon_name)
+            self.update_weapon_level()
+            weapon = WEAPONS.get(weapon_name)
+            settings = {key: self.profile[key].get().strip() for key in TARGET_LABELS}
+            targets = {key: float(settings[key] or 0) for key, _ in TARGETS}
+            additional_targets = tuple((stat, float(settings[key]))
+                                       for key, stat in ADDITIONAL_TARGETS.items() if settings[key])
             settings["required_set"] = selected
 
-            guide = GUIDES.get(name)
+            guide = self.guides.get(name)
             recommendations = guide_defaults(guide)
             groups = tuple(tuple(stat.strip() for stat in group.replace("＝", "=").split("="))
                            for group in guide.priorities) if guide else ()
             profile = Profile(
                 name=name,
                 **targets,
+                additional_targets=additional_targets,
+                character=self.character_panels.get(name),
+                weapon=weapon,
                 element=recommendations["element"],
                 scaling=recommendations["scaling"],
-                base=10000 if recommendations["scaling"] == "生命" else 1000,
+                base=PANEL_BASES[recommendations["scaling"]],
                 ranking=recommendations["ranking"],
                 priorities=tuple(stat for group in groups for stat in group),
                 priority_ranks=tuple(rank for rank, group in enumerate(groups) for _ in group),
@@ -956,6 +1163,7 @@ class Window:
             )
             requirements, firsts = guide.echo_setup(selected) if guide else (
                 ((required_set, 5),) if required_set else (), ())
+            main_layouts = guide.main_layouts(selected) if guide else ()
             profile.validate()
         except ValueError as error:
             self.status.set(str(error))
@@ -963,7 +1171,10 @@ class Window:
         echoes = list(self.echoes.values())
         overrides = {key: value for key, value in settings.items() if value != recommendations[key]}
         self.role_settings[profile.name] = {**overrides, "uses_guide_defaults": True}
-        self.role_choice.set_choices((*ROLE_ORDER, *self.role_settings))
+        if weapon:
+            self.role_settings[profile.name]["weapon_id"] = weapon.id
+        self.show_target_fields({key for key in TARGET_LABELS if settings[key]})
+        self.role_choice.set_choices((*self.role_order, *self.role_settings))
         self.update_first_echo()
         status = (f"正在搜索「{required_set}」" if required_set else
                   f"正在从 {len(echoes)} 件库存中搜索")
@@ -972,7 +1183,8 @@ class Window:
         except OSError:
             status += " · 无法写入角色设置"
         self.status.set(status)
-        self.run(lambda: solve(profile, echoes, set_requirements=requirements, first_echoes=firsts),
+        self.run(lambda: solve(profile, echoes, set_requirements=requirements, first_echoes=firsts,
+                               main_layouts=main_layouts),
                  lambda result: self.show_results(profile, result, echoes))
 
     def scroll_results(self, event):
@@ -1038,11 +1250,22 @@ class Window:
         available = {echo.id: echo for echo in inventory}
         score_label = "推荐词条分" if profile.ranking == "推荐词条" else "伤害指数"
         heading = f"{profile.name} · {result.candidates} 件可用"
+        if profile.weapon:
+            heading += f" · {profile.weapon.name} {profile.weapon.level} 级一阶"
         if result.builds:
             heading += f" · {len(result.builds)} 套搭配"
         if not result.complete:
             heading += " · 搜索超时"
         self.result_label(self.output_body, heading, "Count.TLabel").pack(fill="x", pady=(0, 8))
+        if profile.character:
+            bonuses = profile.character.skill_bonuses
+            if bonuses is None:
+                text = "技能树常驻属性暂无数据"
+            elif bonuses:
+                text = "技能树常驻属性（按点满计入） · " + display_stats(bonuses, " · ")
+            else:
+                text = "技能树无常驻属性节点"
+            self.result_label(self.output_body, text).pack(fill="x", pady=(0, 8))
 
         def mark_worn(echoes, number):
             if self.busy:
@@ -1116,9 +1339,18 @@ class Window:
                 lines.append("触发时  " + " · ".join(triggered))
             goals = profile.goals(build.normal, build.triggered)
             if goals:
-                shortfalls = [f"{name}差 {target - value:.1f} 个百分点"
-                              for name, value, target in goals if value < target - 1e-8]
-                lines.append("目标  " + ("、".join(shortfalls) if shortfalls else "全部达标"))
+                goal_states = []
+                for name, value, target in goals:
+                    percent = name in PERCENT_STATS
+                    suffix = "%" if percent else ""
+                    gap = target - value
+                    unit = " 个百分点" if percent else ""
+                    state = f"差 {gap:,.1f}{unit}" if gap > 1e-8 else "达标"
+                    if name not in {profile.scaling, "暴击", "暴击伤害", "共鸣效率"}:
+                        goal_states.append(f"{name} {value:,.1f}{suffix}（目标 ≥ {target:,g}{suffix}，{state}）")
+                    else:
+                        goal_states.append(f"{name} ≥ {target:,g}{suffix}（{state}）")
+                lines.append("目标  " + " · ".join(goal_states))
             self.result_label(card, "\n".join(lines)).pack(fill="x")
             self.show_build_echoes(card, echoes, build.first.id, profile.name, len(sonatas) > 1)
         if scroll_position:
@@ -1127,8 +1359,6 @@ class Window:
         self.status.set("已更新搭配结果")
 
     def close(self):
-        if self.capture_stop:
-            self.capture_stop.set()
         if self.auto_job:
             self.auto_job.stop_flag.touch()
         self.inventory.close()

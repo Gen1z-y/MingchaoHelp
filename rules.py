@@ -7,6 +7,14 @@ HSIN_SET = "衔梦照世之心"
 HSIN_MAIN = "共鸣回响·天演溯心"
 ELECTRO = "导电伤害加成"
 ENERGY = "共鸣效率"
+ADDITIONAL_TARGETS = {
+    "target_health": "生命",
+    "target_defense": "防御",
+    "target_healing": "治疗效果加成",
+    "target_basic": "普攻伤害加成",
+    "target_heavy": "重击伤害加成",
+    "target_skill": "共鸣技能伤害加成",
+}
 SKILL_TYPES = ("普攻伤害加成", "重击伤害加成", "共鸣技能伤害加成",
                "共鸣解放伤害加成", "")
 ELEMENTS = ("导电", "热熔", "冷凝", "气动", "衍射", "湮灭")
